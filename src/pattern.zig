@@ -1,6 +1,99 @@
 const std = @import("std");
 
-pub const Pattern = extern struct {
+pub const MatchMode = enum {
+    prefix, // Match at start of address
+    suffix, // Match at end of address
+    anywhere, // Match anywhere in address
+};
+
+pub const PatternOptions = struct {
+    ignore_case: bool = true, // Case-insensitive by default (matches solana-keygen behavior)
+    match_mode: MatchMode = .prefix,
+};
+
+pub const Pattern = struct {
+    raw: []const u8,
+    mask: []const bool, // true for fixed chars, false for wildcards
+    options: PatternOptions,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, pattern: []const u8, options: PatternOptions) !Pattern {
+        var mask = try allocator.alloc(bool, pattern.len);
+
+        for (pattern, 0..) |c, i| {
+            mask[i] = (c != '?');
+        }
+
+        return Pattern{
+            .raw = try allocator.dupe(u8, pattern),
+            .mask = mask,
+            .options = options,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Pattern) void {
+        self.allocator.free(self.raw);
+        self.allocator.free(self.mask);
+    }
+
+    pub fn matches(self: Pattern, address: []const u8) bool {
+        return switch (self.options.match_mode) {
+            .prefix => self.matchesAt(address, 0),
+            .suffix => if (address.len >= self.raw.len)
+                self.matchesAt(address, address.len - self.raw.len)
+            else
+                false,
+            .anywhere => self.matchesAnywhere(address),
+        };
+    }
+
+    fn matchesAt(self: Pattern, address: []const u8, start: usize) bool {
+        if (start + self.raw.len > address.len) return false;
+
+        for (self.raw, 0..) |c, i| {
+            if (self.mask[i]) {
+                const addr_char = if (self.options.ignore_case)
+                    std.ascii.toLower(address[start + i])
+                else
+                    address[start + i];
+
+                const pattern_char = if (self.options.ignore_case)
+                    std.ascii.toLower(c)
+                else
+                    c;
+
+                if (addr_char != pattern_char) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    fn matchesAnywhere(self: Pattern, address: []const u8) bool {
+        if (address.len < self.raw.len) return false;
+
+        const max_start = address.len - self.raw.len;
+        var start: usize = 0;
+        while (start <= max_start) : (start += 1) {
+            if (self.matchesAt(address, start)) return true;
+        }
+        return false;
+    }
+
+    /// Get a description of the match mode
+    pub fn matchModeStr(self: Pattern) []const u8 {
+        return switch (self.options.match_mode) {
+            .prefix => "starts with",
+            .suffix => "ends with",
+            .anywhere => "contains",
+        };
+    }
+};
+
+// Legacy extern struct for GPU compatibility (if needed)
+pub const PatternGpu = extern struct {
     pattern_length: u32,
     _padding1: [3]u32,
     fixed_chars: [8]u32,
@@ -15,91 +108,79 @@ pub const Pattern = extern struct {
         std.debug.assert(@alignOf(@This()) == 4);
     }
 
-    pub fn init(allocator: std.mem.Allocator, pattern_str: []const u8, case_sensitive: bool) !Pattern {
-        _ = allocator; // No allocation needed for fixed-size struct
+    pub fn fromPattern(pattern: Pattern) PatternGpu {
+        var result = std.mem.zeroes(PatternGpu);
+        result.pattern_length = @intCast(pattern.raw.len);
+        result.case_sensitive = @intFromBool(!pattern.options.ignore_case);
 
-        var result = std.mem.zeroes(Pattern);
-        result.pattern_length = @intCast(pattern_str.len);
-        result.case_sensitive = @intFromBool(case_sensitive);
-
-        // Convert pattern string to fixed chars and mask
         var fixed_chars = [_]u32{0} ** 8;
-        var mask = [_]u32{0} ** 8;
+        var mask_bits = [_]u32{0} ** 8;
 
-        for (pattern_str, 0..) |c, i| {
-            // Divide by 4 to get which u32 we're in
+        for (pattern.raw, 0..) |c, i| {
             const byte_pos: u32 = @intCast(i >> 2);
-
-            // Multiply by 8 to get bit position
             const bit_shift: u5 = @intCast((i & 3) * 8);
 
-            if (c != '?') {
+            if (pattern.mask[i]) {
                 fixed_chars[byte_pos] |= @as(u32, c) << bit_shift;
-                const mask_val: u32 = 0xFF;
-                mask[byte_pos] |= mask_val << bit_shift;
+                mask_bits[byte_pos] |= @as(u32, 0xFF) << bit_shift;
             }
         }
 
         @memcpy(result.fixed_chars[0..], &fixed_chars);
-        @memcpy(result.mask[0..], &mask);
+        @memcpy(result.mask[0..], &mask_bits);
 
         return result;
     }
-
-    pub fn deinit(self: *Pattern) void {
-        _ = self; // No memory to free
-    }
-
-    pub fn matches(self: Pattern, input: []const u8) bool {
-        // Early return if input is shorter than pattern
-        if (input.len < self.pattern_length) return false;
-
-        // Try matching at each position in input
-        const max_start = input.len - self.pattern_length;
-        var start: usize = 0;
-        while (start <= max_start) : (start += 1) {
-            if (self.matchesAt(input[start..])) return true;
-        }
-        return false;
-    }
-
-    fn matchesAt(self: Pattern, input: []const u8) bool {
-        // Check each character position
-        var i: usize = 0;
-        while (i < self.pattern_length) : (i += 1) {
-            const byte_pos = i >> 2; // Divide by 4 to get which u32 we're in
-            const bit_shift: u5 = @intCast((i & 3) * 8);
-            const mask_byte = (self.mask[byte_pos] >> bit_shift) & 0xFF;
-
-            // Skip wildcard characters
-            if (mask_byte == 0) continue;
-
-            const pattern_char = (self.fixed_chars[byte_pos] >> bit_shift) & 0xFF;
-            const input_char = input[i];
-
-            if (self.case_sensitive == 1) {
-                if (pattern_char != input_char) return false;
-            } else {
-                const pattern_upper = std.ascii.toUpper(@intCast(pattern_char));
-                const input_upper = std.ascii.toUpper(input_char);
-                if (pattern_upper != input_upper) return false;
-            }
-        }
-        return true;
-    }
 };
 
-test "Pattern struct layout" {
-    std.debug.print("\nPattern size: {}, alignment: {}\n", .{ @sizeOf(Pattern), @alignOf(Pattern) });
-    std.debug.print("pattern_length offset: {}\n", .{@offsetOf(Pattern, "pattern_length")});
-    std.debug.print("fixed_chars offset: {}\n", .{@offsetOf(Pattern, "fixed_chars")});
-    std.debug.print("mask offset: {}\n", .{@offsetOf(Pattern, "mask")});
-    std.debug.print("case_sensitive offset: {}\n", .{@offsetOf(Pattern, "case_sensitive")});
+test "Pattern prefix matching" {
+    const allocator = std.testing.allocator;
+    var pattern = try Pattern.init(allocator, "ABC", .{ .match_mode = .prefix });
+    defer pattern.deinit();
 
-    try std.testing.expectEqual(@sizeOf(Pattern), 128);
-    try std.testing.expectEqual(@alignOf(Pattern), 4);
-    try std.testing.expectEqual(@offsetOf(Pattern, "pattern_length"), 0);
-    try std.testing.expectEqual(@offsetOf(Pattern, "fixed_chars"), 16);
-    try std.testing.expectEqual(@offsetOf(Pattern, "mask"), 64);
-    try std.testing.expectEqual(@offsetOf(Pattern, "case_sensitive"), 112);
+    try std.testing.expect(pattern.matches("ABCdef123"));
+    try std.testing.expect(!pattern.matches("xyzABC123"));
+    try std.testing.expect(!pattern.matches("AB"));
+}
+
+test "Pattern suffix matching" {
+    const allocator = std.testing.allocator;
+    var pattern = try Pattern.init(allocator, "XYZ", .{ .match_mode = .suffix });
+    defer pattern.deinit();
+
+    try std.testing.expect(pattern.matches("123abcXYZ"));
+    try std.testing.expect(!pattern.matches("XYZabc123"));
+    try std.testing.expect(!pattern.matches("YZ"));
+}
+
+test "Pattern anywhere matching" {
+    const allocator = std.testing.allocator;
+    var pattern = try Pattern.init(allocator, "TEST", .{ .match_mode = .anywhere });
+    defer pattern.deinit();
+
+    try std.testing.expect(pattern.matches("TESTabc"));
+    try std.testing.expect(pattern.matches("abcTEST"));
+    try std.testing.expect(pattern.matches("abTESTcd"));
+    try std.testing.expect(!pattern.matches("TES"));
+}
+
+test "Pattern case insensitive" {
+    const allocator = std.testing.allocator;
+    var pattern = try Pattern.init(allocator, "AbC", .{ .ignore_case = true, .match_mode = .prefix });
+    defer pattern.deinit();
+
+    try std.testing.expect(pattern.matches("ABCdef"));
+    try std.testing.expect(pattern.matches("abcdef"));
+    try std.testing.expect(pattern.matches("AbCdef"));
+}
+
+test "Pattern wildcards" {
+    const allocator = std.testing.allocator;
+    var pattern = try Pattern.init(allocator, "A?C", .{ .match_mode = .prefix });
+    defer pattern.deinit();
+
+    try std.testing.expect(pattern.matches("ABCdef"));
+    try std.testing.expect(pattern.matches("AXCdef"));
+    try std.testing.expect(pattern.matches("A1Cdef"));
+    try std.testing.expect(!pattern.matches("ABDdef"));
 }
