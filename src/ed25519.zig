@@ -12,12 +12,12 @@ pub const Ed25519 = struct {
     const BASE_TABLE = blk: {
         @setEvalBranchQuota(100000);
         var table: [TABLE_SIZE][32]u8 = undefined;
-        const key_pair = crypto.sign.Ed25519.KeyPair.create([_]u8{1} ** 32) catch unreachable;
+        const key_pair = crypto.sign.Ed25519.KeyPair.generateDeterministic([_]u8{1} ** 32) catch unreachable;
         table[0] = key_pair.public_key.toBytes();
         var i: usize = 1;
         while (i < TABLE_SIZE) : (i += 1) {
             const seed = [_]u8{@truncate(i)} ** 32;
-            const pair = crypto.sign.Ed25519.KeyPair.create(seed) catch unreachable;
+            const pair = crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
             table[i] = pair.public_key.toBytes();
         }
         break :blk table;
@@ -39,7 +39,7 @@ pub const Ed25519 = struct {
         hash[31] |= 0x40;
 
         // Generate key pair using Zig's crypto library
-        const key_pair = crypto.sign.Ed25519.KeyPair.create(hash[0..32].*) catch unreachable;
+        const key_pair = crypto.sign.Ed25519.KeyPair.generateDeterministic(hash[0..32].*) catch unreachable;
         const pub_bytes = key_pair.public_key.toBytes();
 
         // Copy keys

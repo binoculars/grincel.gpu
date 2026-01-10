@@ -1,0 +1,3 @@
+[submodule "libs/zig-metal"]
+	path = libs/zig-metal
+	url = git@github.com:binoculars/zig-metal.git

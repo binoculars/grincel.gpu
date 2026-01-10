@@ -1,5 +1,6 @@
 .{
-    .name = "grincel",
+    .fingerprint = 0xcc53533bdbabd9c3,
+    .name = .grincel,
     .version = "0.1.0",
     .paths = .{
         "src",
@@ -9,7 +10,7 @@
     .dependencies = .{
         .spice = .{
             .url = "https://github.com/judofyr/spice/archive/refs/heads/main.tar.gz",
-            .hash = "12207a3bcf418fd5e029f56f3c8049165cf07d758b89d499d36f8a6475d21b425ea2",
+            .hash = "12201203010a7c0990e2e0e173dbe4bb01eb4648c4784631d5a08f57098ad1743776",
         },
     },
 }
