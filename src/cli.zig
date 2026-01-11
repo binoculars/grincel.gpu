@@ -65,8 +65,11 @@ pub fn run() !void {
     // Default is case-insensitive (matches solana-keygen behavior)
     var ignore_case = !envIsTruthy(allocator, "CASE_SENSITIVE");
     var match_mode = getMatchMode(allocator);
+    var threads_per_group: ?usize = null; // null = use hardware max
 
-    for (args) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--cpu")) {
             use_gpu = false;
         } else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) {
@@ -79,6 +82,17 @@ pub fn run() !void {
             match_mode = .anywhere;
         } else if (std.mem.eql(u8, arg, "--prefix") or std.mem.eql(u8, arg, "--start")) {
             match_mode = .prefix;
+        } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-t")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                threads_per_group = std.fmt.parseInt(usize, args[i], 10) catch {
+                    std.debug.print("Error: Invalid value for --threads: {s}\n", .{args[i]});
+                    return;
+                };
+            } else {
+                std.debug.print("Error: --threads requires a value\n", .{});
+                return;
+            }
         }
     }
 
@@ -87,14 +101,14 @@ pub fn run() !void {
         .match_mode = match_mode,
     };
 
-    try searchVanity(allocator, pattern_str, options, use_gpu, match_count);
+    try searchVanity(allocator, pattern_str, options, use_gpu, match_count, threads_per_group);
 }
 
 // ============================================================================
 // Search Functions
 // ============================================================================
 
-fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: PatternOptions, use_gpu: bool, match_count: u32) !void {
+fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: PatternOptions, use_gpu: bool, match_count: u32, threads_per_group: ?usize) !void {
     std.debug.print("\n=== Solana Vanity Address Search ===\n", .{});
     std.debug.print("Pattern: {s}\n", .{pattern_str});
     std.debug.print("Match mode: {s}\n", .{@tagName(options.match_mode)});
@@ -122,7 +136,7 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
     var found_count: u32 = 0;
 
     if (use_gpu) {
-        var grinder = try FullGpuGrinder.init(allocator, pattern);
+        var grinder = try FullGpuGrinder.init(allocator, pattern, threads_per_group);
         defer grinder.deinit();
         grinder.setP50(stats.p50_attempts);
 
@@ -243,7 +257,7 @@ fn runBenchmark(allocator: std.mem.Allocator) !void {
 
     // Hybrid GPU+CPU Benchmark
     std.debug.print("Hybrid (GPU seeds + CPU derive) benchmark...\n", .{});
-    var hybrid_grinder = try HybridGrinder.init(allocator, pattern);
+    var hybrid_grinder = try HybridGrinder.init(allocator, pattern, null);
     defer hybrid_grinder.deinit();
 
     const hybrid_start = std.time.milliTimestamp();
@@ -259,7 +273,7 @@ fn runBenchmark(allocator: std.mem.Allocator) !void {
 
     // Full GPU Benchmark
     std.debug.print("Full GPU (all on GPU) benchmark...\n", .{});
-    var fullgpu_grinder = try FullGpuGrinder.init(allocator, pattern);
+    var fullgpu_grinder = try FullGpuGrinder.init(allocator, pattern, null);
     defer fullgpu_grinder.deinit();
 
     const fullgpu_start = std.time.milliTimestamp();
@@ -366,6 +380,7 @@ fn printUsage() void {
     std.debug.print("\nOptions:\n", .{});
     std.debug.print("  -h, --help            Show this help message\n", .{});
     std.debug.print("  -s, --case-sensitive  Case sensitive matching\n", .{});
+    std.debug.print("  -t, --threads N       Threads per threadgroup (default: 64)\n", .{});
     std.debug.print("  --cpu                 Use CPU only (no GPU)\n", .{});
     std.debug.print("  --prefix              Match at start of address (default)\n", .{});
     std.debug.print("  --suffix              Match at end of address\n", .{});
@@ -378,8 +393,8 @@ fn printUsage() void {
     std.debug.print("\nValid characters: 1-9, A-H, J-N, P-Z, a-k, m-z (Base58, no 0/O/I/l)\n", .{});
     std.debug.print("\nOutput: Keys are saved as <address>.json (Solana keypair format)\n", .{});
     std.debug.print("\nExamples:\n", .{});
-    std.debug.print("  grincel SOL                    # Find one address starting with 'sol'\n", .{});
-    std.debug.print("  grincel SOL:5                  # Find 5 addresses starting with 'sol'\n", .{});
+    std.debug.print("  grincel Ace                    # Find one address starting with 'ace'\n", .{});
+    std.debug.print("  grincel Ace:5                  # Find 5 addresses starting with 'ace'\n", .{});
     std.debug.print("  grincel ABC -s                 # Case-sensitive: starts with 'ABC'\n", .{});
     std.debug.print("  grincel XYZ --suffix           # Address ends with 'xyz'\n", .{});
     std.debug.print("  grincel A?C                    # Wildcard: A_C where _ is any char\n", .{});

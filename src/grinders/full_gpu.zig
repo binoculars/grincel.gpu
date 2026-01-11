@@ -24,11 +24,12 @@ pub const FullGpuGrinder = struct {
     allocator: std.mem.Allocator,
     cpu_prng: std.Random.Xoshiro256,
     max_threads_per_group: usize,
+    threads_per_group: usize, // Actual value to use (may be user-specified or hardware max)
     p50_attempts: f64,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, pattern: Pattern) !Self {
+    pub fn init(allocator: std.mem.Allocator, pattern: Pattern, threads_per_group_override: ?usize) !Self {
         const device = mtl.createSystemDefaultDevice() orelse {
             return error.NoMetalDevice;
         };
@@ -69,7 +70,10 @@ pub const FullGpuGrinder = struct {
         };
 
         const max_threads = compute_pso.maxTotalThreadsPerThreadgroup();
+        const default_threads: usize = 64;
+        const threads_to_use = if (threads_per_group_override) |t| @min(t, max_threads) else @min(default_threads, max_threads);
         std.debug.print("Max threads per threadgroup: {d}\n", .{max_threads});
+        std.debug.print("Using threads per threadgroup: {d}\n", .{threads_to_use});
         std.debug.print("Full GPU mode: SHA512 + Ed25519 + Base58 + Pattern all on GPU\n", .{});
 
         // Create buffers
@@ -127,6 +131,7 @@ pub const FullGpuGrinder = struct {
             .allocator = allocator,
             .cpu_prng = std.Random.Xoshiro256.init(cpu_seed),
             .max_threads_per_group = max_threads,
+            .threads_per_group = threads_to_use,
             .p50_attempts = 0, // Set via setP50() before searching
         };
     }
@@ -168,7 +173,7 @@ pub const FullGpuGrinder = struct {
 
         const grid_size = mtl.MTLSize{ .width = BATCH_SIZE, .height = 1, .depth = 1 };
         const threadgroup_size = mtl.MTLSize{
-            .width = @min(self.max_threads_per_group, 256),
+            .width = self.threads_per_group,
             .height = 1,
             .depth = 1,
         };

@@ -29,6 +29,7 @@ grincel <pattern>[:<count>] [options]
 Options:
   -h, --help            Show help message
   -s, --case-sensitive  Case sensitive matching
+  -t, --threads N       Threads per threadgroup (default: 64)
   --cpu                 Use CPU only (no GPU)
   --prefix              Match at start of address (default)
   --suffix              Match at end of address
@@ -46,13 +47,13 @@ Valid characters: 1-9, A-H, J-N, P-Z, a-k, m-z (Base58, no 0/O/I/l)
 ## Example
 
 ```bash
-$ ./zig-out/bin/grincel SOL:2
+$ ./zig-out/bin/grincel Ace:2
 ```
 
 Output:
 ```
 === Solana Vanity Address Search ===
-Pattern: SOL
+Pattern: Ace
 Match mode: prefix
 Case sensitive: false
 Finding: 2 matches
@@ -70,16 +71,16 @@ Metal Device: Apple M1 Max
 Searching...
 
 *** FOUND MATCH 1/2! ***
-Address: SoLNY6vrNHjShkazB1YZWYJzLDrZ8UQ3EVrgMMnRtNf
-Public Key (Base58): SoLNY6vrNHjShkazB1YZWYJzLDrZ8UQ3EVrgMMnRtNf
+Address: AceNY6vrNHjShkazB1YZWYJzLDrZ8UQ3EVrgMMnRtNf
+Public Key (Base58): AceNY6vrNHjShkazB1YZWYJzLDrZ8UQ3EVrgMMnRtNf
 VERIFIED: Address matches Base58(PublicKey)
-Saved: SoLNY6vrNHjShkazB1YZWYJzLDrZ8UQ3EVrgMMnRtNf.json
+Saved: AceNY6vrNHjShkazB1YZWYJzLDrZ8UQ3EVrgMMnRtNf.json
 
 *** FOUND MATCH 2/2! ***
-Address: SoLqJzPXAkcVCcBCWsHT3fKbTNzoyAXxEBHABCdeFgh
-Public Key (Base58): SoLqJzPXAkcVCcBCWsHT3fKbTNzoyAXxEBHABCdeFgh
+Address: AceqJzPXAkcVCcBCWsHT3fKbTNzoyAXxEBHABCdeFgh
+Public Key (Base58): AceqJzPXAkcVCcBCWsHT3fKbTNzoyAXxEBHABCdeFgh
 VERIFIED: Address matches Base58(PublicKey)
-Saved: SoLqJzPXAkcVCcBCWsHT3fKbTNzoyAXxEBHABCdeFgh.json
+Saved: AceqJzPXAkcVCcBCWsHT3fKbTNzoyAXxEBHABCdeFgh.json
 
 Done! Found 2 matching address(es).
 ```
@@ -97,8 +98,8 @@ This format is compatible with `solana-keygen` and can be used directly with Sol
 ## More Examples
 
 ```bash
-# Find 5 addresses starting with 'SOL'
-./zig-out/bin/grincel SOL:5
+# Find 5 addresses starting with 'Ace'
+./zig-out/bin/grincel Ace:5
 
 # Case-sensitive match
 ./zig-out/bin/grincel ABC -s
@@ -107,13 +108,16 @@ This format is compatible with `solana-keygen` and can be used directly with Sol
 ./zig-out/bin/grincel XYZ --suffix
 
 # Match anywhere in address
-./zig-out/bin/grincel COOL --anywhere
+./zig-out/bin/grincel Fun --anywhere
 
 # Wildcard pattern (matches A?C where ? is any char)
 ./zig-out/bin/grincel A?C
 
 # CPU-only mode
 ./zig-out/bin/grincel TEST --cpu
+
+# Use 128 threads per threadgroup (experiment for best performance)
+./zig-out/bin/grincel Ace -t 128
 ```
 
 ## Input Validation
