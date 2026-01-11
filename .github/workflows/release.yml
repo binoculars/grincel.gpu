@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: brew bundle
+
+      - name: Check Zig version
+        run: zig version
+
+      - name: Build (Release)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create release archive
+        run: |
+          cd zig-out/bin
+          tar -czvf grincel-${{ steps.version.outputs.VERSION }}-macos-arm64.tar.gz grincel
+          shasum -a 256 grincel-${{ steps.version.outputs.VERSION }}-macos-arm64.tar.gz > grincel-${{ steps.version.outputs.VERSION }}-macos-arm64.tar.gz.sha256
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            zig-out/bin/grincel-${{ steps.version.outputs.VERSION }}-macos-arm64.tar.gz
+            zig-out/bin/grincel-${{ steps.version.outputs.VERSION }}-macos-arm64.tar.gz.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-') }}
