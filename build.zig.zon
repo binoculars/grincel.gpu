@@ -4,6 +4,7 @@
     .version = "0.1.0",
     .paths = .{
         "src",
+        "libs",
         "build.zig",
         "build.zig.zon",
     },
@@ -19,6 +20,10 @@
         .vulkan_headers = .{
             .url = "git+https://github.com/KhronosGroup/Vulkan-Headers#0777a3ad88bad5f4b11cfd509458bbc0ddadc773",
             .hash = "N-V-__8AAMZuLQIcPe--JSv0kn_Ga8tsjgbkaojW0OHW2Rfd",
+        },
+        .zig_metal = .{
+            .url = "git+https://github.com/binoculars/zig-metal#main",
+            .hash = "N-V-__8AAPisPgBOnobLBlpfNHrw9K83kxf1I1S98aQ5-A1c",
         },
     },
 }

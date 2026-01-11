@@ -6,14 +6,15 @@ pub fn build(b: *std.Build) void {
 
     const is_macos = target.result.os.tag == .macos;
 
-    // Create zigtrait module (dependency of zig-metal)
+    // Create zigtrait module (vendored due to Zig 0.15 build.zig incompatibility upstream)
     const zigtrait_module = b.addModule("zigtrait", .{
-        .root_source_file = b.path("libs/zig-metal/libs/zigtrait/src/zigtrait.zig"),
+        .root_source_file = b.path("libs/zigtrait/zigtrait.zig"),
     });
 
-    // Create zig-metal module (only used on macOS)
+    // Get zig-metal dependency and create module with zigtrait import
+    const zig_metal_dep = b.dependency("zig_metal", .{});
     const zig_metal_module = b.addModule("zig-metal", .{
-        .root_source_file = b.path("libs/zig-metal/src/main.zig"),
+        .root_source_file = zig_metal_dep.path("src/main.zig"),
         .imports = &.{
             .{ .name = "zigtrait", .module = zigtrait_module },
         },
