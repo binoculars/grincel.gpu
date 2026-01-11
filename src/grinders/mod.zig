@@ -1,11 +1,14 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const pattern_mod = @import("../pattern.zig");
 pub const Pattern = pattern_mod.Pattern;
 
 // Re-export grinder implementations
 pub const CpuGrinder = @import("cpu.zig").CpuGrinder;
-pub const HybridGrinder = @import("hybrid.zig").HybridGrinder;
-pub const FullGpuGrinder = @import("full_gpu.zig").FullGpuGrinder;
+pub const VulkanGrinder = @import("vulkan.zig").VulkanGrinder;
+
+// MetalGrinder only available on macOS
+pub const MetalGrinder = if (build_options.is_macos) @import("metal.zig").MetalGrinder else void;
 
 // ============================================================================
 // Configuration
@@ -16,8 +19,8 @@ pub const NUM_BUFFERS: usize = 3; // Triple buffering for continuous GPU utiliza
 pub const PROGRESS_INTERVAL: u64 = 100000; // Report every N attempts
 pub const NUM_CPU_THREADS: usize = 8; // CPU threads for parallel key derivation
 
-// Shader is embedded at compile time - no external file needed at runtime
-pub const EMBEDDED_SHADER = @embedFile("../shaders/vanity.metal");
+// Metal shader is embedded at compile time - only on macOS
+pub const EMBEDDED_SHADER = if (build_options.is_macos) @embedFile("../shaders/vanity.metal") else "";
 
 // ============================================================================
 // Shared Types

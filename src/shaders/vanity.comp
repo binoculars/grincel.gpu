@@ -1,0 +1,639 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================================================
+// Buffer Bindings
+// ============================================================================
+
+layout(std430, binding = 0) buffer StateBuffer {
+    uint64_t base_state[2];
+};
+
+layout(std430, binding = 1) buffer PatternBuffer {
+    uint length;
+    uint match_mode;  // 0=prefix, 1=suffix, 2=anywhere
+    uint ignore_case;
+    uint pattern[8];  // 32 bytes as uint array
+};
+
+layout(std430, binding = 2) buffer ResultBuffer {
+    uint found;
+    uint thread_id;
+    uint public_key[8];    // 32 bytes
+    uint private_key[16];  // 64 bytes
+    uint address_data[12]; // 48 bytes
+    uint address_len;
+};
+
+layout(std430, binding = 3) buffer FoundFlag {
+    uint found_flag;
+};
+
+// ============================================================================
+// SHA-512 Constants
+// ============================================================================
+
+const uint64_t K512[80] = uint64_t[80](
+    0x428a2f98d728ae22UL, 0x7137449123ef65cdUL, 0xb5c0fbcfec4d3b2fUL, 0xe9b5dba58189dbbcUL,
+    0x3956c25bf348b538UL, 0x59f111f1b605d019UL, 0x923f82a4af194f9bUL, 0xab1c5ed5da6d8118UL,
+    0xd807aa98a3030242UL, 0x12835b0145706fbeUL, 0x243185be4ee4b28cUL, 0x550c7dc3d5ffb4e2UL,
+    0x72be5d74f27b896fUL, 0x80deb1fe3b1696b1UL, 0x9bdc06a725c71235UL, 0xc19bf174cf692694UL,
+    0xe49b69c19ef14ad2UL, 0xefbe4786384f25e3UL, 0x0fc19dc68b8cd5b5UL, 0x240ca1cc77ac9c65UL,
+    0x2de92c6f592b0275UL, 0x4a7484aa6ea6e483UL, 0x5cb0a9dcbd41fbd4UL, 0x76f988da831153b5UL,
+    0x983e5152ee66dfabUL, 0xa831c66d2db43210UL, 0xb00327c898fb213fUL, 0xbf597fc7beef0ee4UL,
+    0xc6e00bf33da88fc2UL, 0xd5a79147930aa725UL, 0x06ca6351e003826fUL, 0x142929670a0e6e70UL,
+    0x27b70a8546d22ffcUL, 0x2e1b21385c26c926UL, 0x4d2c6dfc5ac42aedUL, 0x53380d139d95b3dfUL,
+    0x650a73548baf63deUL, 0x766a0abb3c77b2a8UL, 0x81c2c92e47edaee6UL, 0x92722c851482353bUL,
+    0xa2bfe8a14cf10364UL, 0xa81a664bbc423001UL, 0xc24b8b70d0f89791UL, 0xc76c51a30654be30UL,
+    0xd192e819d6ef5218UL, 0xd69906245565a910UL, 0xf40e35855771202aUL, 0x106aa07032bbd1b8UL,
+    0x19a4c116b8d2d0c8UL, 0x1e376c085141ab53UL, 0x2748774cdf8eeb99UL, 0x34b0bcb5e19b48a8UL,
+    0x391c0cb3c5c95a63UL, 0x4ed8aa4ae3418acbUL, 0x5b9cca4f7763e373UL, 0x682e6ff3d6b2b8a3UL,
+    0x748f82ee5defb2fcUL, 0x78a5636f43172f60UL, 0x84c87814a1f0ab72UL, 0x8cc702081a6439ecUL,
+    0x90befffa23631e28UL, 0xa4506cebde82bde9UL, 0xbef9a3f7b2c67915UL, 0xc67178f2e372532bUL,
+    0xca273eceea26619cUL, 0xd186b8c721c0c207UL, 0xeada7dd6cde0eb1eUL, 0xf57d4f7fee6ed178UL,
+    0x06f067aa72176fbaUL, 0x0a637dc5a2c898a6UL, 0x113f9804bef90daeUL, 0x1b710b35131c471bUL,
+    0x28db77f523047d84UL, 0x32caab7b40c72493UL, 0x3c9ebe0a15c9bebcUL, 0x431d67c49c100d4cUL,
+    0x4cc5d4becb3e42b6UL, 0x597f299cfc657e2aUL, 0x5fcb6fab3ad6faecUL, 0x6c44198c4a475817UL
+);
+
+// ============================================================================
+// SHA-512 Helper Functions
+// ============================================================================
+
+uint64_t rotr64(uint64_t x, uint n) {
+    return (x >> n) | (x << (64u - n));
+}
+
+uint64_t Ch(uint64_t x, uint64_t y, uint64_t z) {
+    return (x & y) ^ (~x & z);
+}
+
+uint64_t Maj(uint64_t x, uint64_t y, uint64_t z) {
+    return (x & y) ^ (x & z) ^ (y & z);
+}
+
+uint64_t Sigma0_sha(uint64_t x) {
+    return rotr64(x, 28u) ^ rotr64(x, 34u) ^ rotr64(x, 39u);
+}
+
+uint64_t Sigma1_sha(uint64_t x) {
+    return rotr64(x, 14u) ^ rotr64(x, 18u) ^ rotr64(x, 41u);
+}
+
+uint64_t sigma0_sha(uint64_t x) {
+    return rotr64(x, 1u) ^ rotr64(x, 8u) ^ (x >> 7u);
+}
+
+uint64_t sigma1_sha(uint64_t x) {
+    return rotr64(x, 19u) ^ rotr64(x, 61u) ^ (x >> 6u);
+}
+
+// SHA-512 hash of 32-byte input, output 64 bytes
+void sha512_32bytes(in uint input_bytes[8], out uint output_bytes[16]) {
+    uint64_t h[8] = uint64_t[8](
+        0x6a09e667f3bcc908UL, 0xbb67ae8584caa73bUL,
+        0x3c6ef372fe94f82bUL, 0xa54ff53a5f1d36f1UL,
+        0x510e527fade682d1UL, 0x9b05688c2b3e6c1fUL,
+        0x1f83d9abfb41bd6bUL, 0x5be0cd19137e2179UL
+    );
+
+    uint64_t w[80];
+
+    // Copy input as big-endian uint64 (input is 8 x uint32 = 32 bytes)
+    for (int i = 0; i < 4; i++) {
+        uint lo = input_bytes[i * 2];
+        uint hi = input_bytes[i * 2 + 1];
+        // Convert from little-endian uint32 pairs to big-endian uint64
+        uint64_t val = 0UL;
+        val |= uint64_t((lo >> 0u) & 0xFFu) << 56u;
+        val |= uint64_t((lo >> 8u) & 0xFFu) << 48u;
+        val |= uint64_t((lo >> 16u) & 0xFFu) << 40u;
+        val |= uint64_t((lo >> 24u) & 0xFFu) << 32u;
+        val |= uint64_t((hi >> 0u) & 0xFFu) << 24u;
+        val |= uint64_t((hi >> 8u) & 0xFFu) << 16u;
+        val |= uint64_t((hi >> 16u) & 0xFFu) << 8u;
+        val |= uint64_t((hi >> 24u) & 0xFFu) << 0u;
+        w[i] = val;
+    }
+
+    // Padding
+    w[4] = 0x8000000000000000UL;
+    for (int i = 5; i < 15; i++) w[i] = 0UL;
+    w[15] = 256UL;  // Length in bits
+
+    // Extend
+    for (int i = 16; i < 80; i++) {
+        w[i] = sigma1_sha(w[i-2]) + w[i-7] + sigma0_sha(w[i-15]) + w[i-16];
+    }
+
+    // Compress
+    uint64_t a = h[0], b = h[1], c = h[2], d = h[3];
+    uint64_t e = h[4], f = h[5], g = h[6], hh = h[7];
+
+    for (int i = 0; i < 80; i++) {
+        uint64_t T1 = hh + Sigma1_sha(e) + Ch(e, f, g) + K512[i] + w[i];
+        uint64_t T2 = Sigma0_sha(a) + Maj(a, b, c);
+        hh = g; g = f; f = e; e = d + T1;
+        d = c; c = b; b = a; a = T1 + T2;
+    }
+
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+
+    // Output as bytes (big-endian) stored in uint32 array
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = h[i];
+        // Big-endian bytes to little-endian uint32 pairs
+        output_bytes[i * 2] = uint((v >> 56u) & 0xFFUL) |
+                             (uint((v >> 48u) & 0xFFUL) << 8u) |
+                             (uint((v >> 40u) & 0xFFUL) << 16u) |
+                             (uint((v >> 32u) & 0xFFUL) << 24u);
+        output_bytes[i * 2 + 1] = uint((v >> 24u) & 0xFFUL) |
+                                  (uint((v >> 16u) & 0xFFUL) << 8u) |
+                                  (uint((v >> 8u) & 0xFFUL) << 16u) |
+                                  (uint((v >> 0u) & 0xFFUL) << 24u);
+    }
+}
+
+// Helper to get byte from uint32 array
+uint get_byte(in uint arr[16], int idx) {
+    int word_idx = idx / 4;
+    int byte_idx = idx % 4;
+    return (arr[word_idx] >> (byte_idx * 8u)) & 0xFFu;
+}
+
+void set_byte(inout uint arr[16], int idx, uint val) {
+    int word_idx = idx / 4;
+    int byte_idx = idx % 4;
+    uint mask = ~(0xFFu << (byte_idx * 8u));
+    arr[word_idx] = (arr[word_idx] & mask) | ((val & 0xFFu) << (byte_idx * 8u));
+}
+
+uint get_byte8(in uint arr[8], int idx) {
+    int word_idx = idx / 4;
+    int byte_idx = idx % 4;
+    return (arr[word_idx] >> (byte_idx * 8u)) & 0xFFu;
+}
+
+// ============================================================================
+// Field Element (mod 2^255 - 19)
+// ============================================================================
+
+struct Fe {
+    int64_t v[5];
+};
+
+void fe_reduce(inout Fe f) {
+    int64_t c;
+    for (int i = 0; i < 4; i++) {
+        c = f.v[i] >> 51;
+        f.v[i] &= 0x7ffffffffffffL;
+        f.v[i + 1] += c;
+    }
+    c = f.v[4] >> 51;
+    f.v[4] &= 0x7ffffffffffffL;
+    f.v[0] += c * 19L;
+
+    c = f.v[0] >> 51;
+    f.v[0] &= 0x7ffffffffffffL;
+    f.v[1] += c;
+}
+
+void fe_from_bytes(out Fe f, in uint b[8]) {
+    // b is 8 uint32 = 32 bytes in little-endian
+    uint64_t h0 = uint64_t(b[0]) | (uint64_t(b[1]) << 32u);
+    uint64_t h1 = uint64_t(b[2]) | (uint64_t(b[3]) << 32u);
+    uint64_t h2 = uint64_t(b[4]) | (uint64_t(b[5]) << 32u);
+    uint64_t h3 = uint64_t(b[6]) | (uint64_t(b[7] & 0x7FFFFFFFu) << 32u);
+
+    f.v[0] = int64_t(h0 & 0x7ffffffffffffUL);
+    f.v[1] = int64_t((h0 >> 51u) | ((h1 & 0x3fffffffffUL) << 13u)) & 0x7ffffffffffffL;
+    f.v[2] = int64_t((h1 >> 38u) | ((h2 & 0x1ffffffUL) << 26u)) & 0x7ffffffffffffL;
+    f.v[3] = int64_t((h2 >> 25u) | ((h3 & 0xfffUL) << 39u)) & 0x7ffffffffffffL;
+    f.v[4] = int64_t(h3 >> 12u) & 0x7ffffffffffffL;
+}
+
+void fe_to_bytes(out uint b[8], in Fe f) {
+    Fe t = f;
+    fe_reduce(t);
+
+    int64_t c = (t.v[0] + 19L) >> 51;
+    c = (t.v[1] + c) >> 51;
+    c = (t.v[2] + c) >> 51;
+    c = (t.v[3] + c) >> 51;
+    c = (t.v[4] + c) >> 51;
+    t.v[0] += 19L * c;
+
+    c = t.v[0] >> 51; t.v[0] &= 0x7ffffffffffffL; t.v[1] += c;
+    c = t.v[1] >> 51; t.v[1] &= 0x7ffffffffffffL; t.v[2] += c;
+    c = t.v[2] >> 51; t.v[2] &= 0x7ffffffffffffL; t.v[3] += c;
+    c = t.v[3] >> 51; t.v[3] &= 0x7ffffffffffffL; t.v[4] += c;
+    t.v[4] &= 0x7ffffffffffffL;
+
+    uint64_t h0 = uint64_t(t.v[0]) | (uint64_t(t.v[1]) << 51u);
+    uint64_t h1 = (uint64_t(t.v[1]) >> 13u) | (uint64_t(t.v[2]) << 38u);
+    uint64_t h2 = (uint64_t(t.v[2]) >> 26u) | (uint64_t(t.v[3]) << 25u);
+    uint64_t h3 = (uint64_t(t.v[3]) >> 39u) | (uint64_t(t.v[4]) << 12u);
+
+    b[0] = uint(h0);
+    b[1] = uint(h0 >> 32u);
+    b[2] = uint(h1);
+    b[3] = uint(h1 >> 32u);
+    b[4] = uint(h2);
+    b[5] = uint(h2 >> 32u);
+    b[6] = uint(h3);
+    b[7] = uint(h3 >> 32u);
+}
+
+void fe_add(out Fe r, in Fe a, in Fe b) {
+    for (int i = 0; i < 5; i++) r.v[i] = a.v[i] + b.v[i];
+}
+
+void fe_sub(out Fe r, in Fe a, in Fe b) {
+    r.v[0] = a.v[0] - b.v[0] + 0xfffffffffffdaL;
+    r.v[1] = a.v[1] - b.v[1] + 0xffffffffffffeL;
+    r.v[2] = a.v[2] - b.v[2] + 0xffffffffffffeL;
+    r.v[3] = a.v[3] - b.v[3] + 0xffffffffffffeL;
+    r.v[4] = a.v[4] - b.v[4] + 0xffffffffffffeL;
+}
+
+void fe_mul(out Fe r, in Fe a, in Fe b) {
+    int64_t a0 = a.v[0], a1 = a.v[1], a2 = a.v[2], a3 = a.v[3], a4 = a.v[4];
+    int64_t b0 = b.v[0], b1 = b.v[1], b2 = b.v[2], b3 = b.v[3], b4 = b.v[4];
+
+    int64_t r0 = a0*b0 + 19L*(a1*b4 + a2*b3 + a3*b2 + a4*b1);
+    int64_t r1 = a0*b1 + a1*b0 + 19L*(a2*b4 + a3*b3 + a4*b2);
+    int64_t r2 = a0*b2 + a1*b1 + a2*b0 + 19L*(a3*b4 + a4*b3);
+    int64_t r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 + 19L*a4*b4;
+    int64_t r4 = a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0;
+
+    r.v[0] = r0; r.v[1] = r1; r.v[2] = r2; r.v[3] = r3; r.v[4] = r4;
+    fe_reduce(r);
+}
+
+void fe_sq(out Fe r, in Fe a) {
+    fe_mul(r, a, a);
+}
+
+void fe_invert(out Fe r, in Fe z) {
+    Fe t0, t1, t2, t3;
+
+    fe_sq(t0, z);
+    fe_sq(t1, t0);
+    fe_sq(t1, t1);
+    fe_mul(t1, z, t1);
+    fe_mul(t0, t0, t1);
+    fe_sq(t2, t0);
+    fe_mul(t1, t1, t2);
+    fe_sq(t2, t1);
+    for (int i = 0; i < 4; i++) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    fe_sq(t2, t1);
+    for (int i = 0; i < 9; i++) fe_sq(t2, t2);
+    fe_mul(t2, t2, t1);
+    fe_sq(t3, t2);
+    for (int i = 0; i < 19; i++) fe_sq(t3, t3);
+    fe_mul(t2, t3, t2);
+    for (int i = 0; i < 10; i++) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    fe_sq(t2, t1);
+    for (int i = 0; i < 49; i++) fe_sq(t2, t2);
+    fe_mul(t2, t2, t1);
+    fe_sq(t3, t2);
+    for (int i = 0; i < 99; i++) fe_sq(t3, t3);
+    fe_mul(t2, t3, t2);
+    for (int i = 0; i < 50; i++) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    for (int i = 0; i < 5; i++) fe_sq(t1, t1);
+    fe_mul(r, t1, t0);
+}
+
+// ============================================================================
+// Ed25519 Point Operations
+// ============================================================================
+
+struct GeP3 {
+    Fe X, Y, Z, T;
+};
+
+const int64_t GX[5] = int64_t[5](
+    0x62d608f25d51aL, 0x412a4b4f6592aL, 0x75b7171a4b31dL, 0x1ff60527118feL, 0x216936d3cd6e5L
+);
+const int64_t GY[5] = int64_t[5](
+    0x6666666666658L, 0x4ccccccccccccL, 0x1999999999999L, 0x3333333333333L, 0x6666666666666L
+);
+const int64_t D_CONST[5] = int64_t[5](
+    0x34dca135978a3L, 0x1a8283b156ebdL, 0x5e7a26001c029L, 0x739c663a03cbbL, 0x52036cee2b6ffL
+);
+
+void ge_p3_0(out GeP3 p) {
+    for (int i = 0; i < 5; i++) {
+        p.X.v[i] = 0L;
+        p.Y.v[i] = (i == 0) ? 1L : 0L;
+        p.Z.v[i] = (i == 0) ? 1L : 0L;
+        p.T.v[i] = 0L;
+    }
+}
+
+void ge_p3_dbl(out GeP3 r, in GeP3 p) {
+    Fe A, B, C, D, E, F, G, H;
+
+    fe_sq(A, p.X);
+    fe_sq(B, p.Y);
+    fe_sq(C, p.Z);
+    fe_add(C, C, C);
+
+    D.v[0] = 0xfffffffffffdaL - A.v[0];
+    D.v[1] = 0xffffffffffffeL - A.v[1];
+    D.v[2] = 0xffffffffffffeL - A.v[2];
+    D.v[3] = 0xffffffffffffeL - A.v[3];
+    D.v[4] = 0xffffffffffffeL - A.v[4];
+
+    fe_add(E, p.X, p.Y);
+    fe_sq(E, E);
+    fe_sub(E, E, A);
+    fe_sub(E, E, B);
+
+    fe_add(G, D, B);
+    fe_sub(F, G, C);
+    fe_sub(H, D, B);
+
+    fe_mul(r.X, E, F);
+    fe_mul(r.Y, G, H);
+    fe_mul(r.T, E, H);
+    fe_mul(r.Z, F, G);
+}
+
+void ge_p3_add(out GeP3 r, in GeP3 p, in GeP3 q) {
+    Fe A, B, C, D, E, F, G, H;
+    Fe d2, qyminusx, qyplusx;
+
+    for (int i = 0; i < 5; i++) d2.v[i] = D_CONST[i] * 2L;
+
+    fe_sub(A, p.Y, p.X);
+    fe_sub(qyminusx, q.Y, q.X);
+    fe_mul(A, A, qyminusx);
+
+    fe_add(B, p.Y, p.X);
+    fe_add(qyplusx, q.Y, q.X);
+    fe_mul(B, B, qyplusx);
+
+    fe_mul(C, p.T, q.T);
+    fe_mul(C, C, d2);
+
+    fe_mul(D, p.Z, q.Z);
+    fe_add(D, D, D);
+
+    fe_sub(E, B, A);
+    fe_sub(F, D, C);
+    fe_add(G, D, C);
+    fe_add(H, B, A);
+
+    fe_mul(r.X, E, F);
+    fe_mul(r.Y, G, H);
+    fe_mul(r.T, E, H);
+    fe_mul(r.Z, F, G);
+}
+
+void ge_scalarmult_base(out GeP3 r, in uint s[8]) {
+    ge_p3_0(r);
+
+    GeP3 G;
+    for (int i = 0; i < 5; i++) {
+        G.X.v[i] = GX[i];
+        G.Y.v[i] = GY[i];
+        G.Z.v[i] = (i == 0) ? 1L : 0L;
+    }
+    fe_mul(G.T, G.X, G.Y);
+
+    GeP3 Q = G;
+
+    for (int i = 0; i < 256; i++) {
+        int word_idx = i / 32;
+        int bit_idx = i % 32;
+
+        if (((s[word_idx] >> bit_idx) & 1u) != 0u) {
+            ge_p3_add(r, r, Q);
+        }
+        ge_p3_dbl(Q, Q);
+    }
+}
+
+void ge_p3_tobytes(out uint out_bytes[8], in GeP3 p) {
+    Fe recip, x, y;
+
+    fe_invert(recip, p.Z);
+    fe_mul(x, p.X, recip);
+    fe_mul(y, p.Y, recip);
+
+    fe_to_bytes(out_bytes, y);
+    // Encode sign of x in high bit of last byte
+    out_bytes[7] ^= uint((x.v[0] & 1L) << 31);
+}
+
+// ============================================================================
+// Base58 Encoding
+// ============================================================================
+
+const uint BASE58_ALPHABET[58] = uint[58](
+    49u,50u,51u,52u,53u,54u,55u,56u,57u,  // '1'-'9'
+    65u,66u,67u,68u,69u,70u,71u,72u,74u,75u,76u,77u,78u,80u,81u,82u,83u,84u,85u,86u,87u,88u,89u,90u,  // 'A'-'Z' (no I, O)
+    97u,98u,99u,100u,101u,102u,103u,104u,105u,106u,107u,109u,110u,111u,112u,113u,114u,115u,116u,117u,118u,119u,120u,121u,122u  // 'a'-'z' (no l)
+);
+
+// input: 8 uint32 = 32 bytes, output: 12 uint32 = 48 bytes (chars as bytes)
+int base58_encode(in uint in_data[8], out uint out_data[12]) {
+    // Count leading zero bytes
+    int zeros = 0;
+    for (int i = 0; i < 32 && zeros < 32; i++) {
+        uint byte_val = (in_data[i / 4] >> ((i % 4) * 8u)) & 0xFFu;
+        if (byte_val == 0u) zeros++;
+        else break;
+    }
+
+    // Convert to base58
+    uint b58[64];
+    for (int i = 0; i < 64; i++) b58[i] = 0u;
+    int b58_len = 0;
+
+    for (int i = zeros; i < 32; i++) {
+        uint byte_val = (in_data[i / 4] >> ((i % 4) * 8u)) & 0xFFu;
+        uint carry = byte_val;
+        for (int j = 0; j < b58_len || carry != 0u; j++) {
+            if (j < b58_len) carry += b58[j] * 256u;
+            b58[j] = carry % 58u;
+            carry /= 58u;
+            if (j >= b58_len) b58_len = j + 1;
+        }
+    }
+
+    // Clear out_data
+    for (int i = 0; i < 12; i++) out_data[i] = 0u;
+
+    // Output
+    int out_len = zeros + b58_len;
+    for (int i = 0; i < zeros; i++) {
+        int word_idx = i / 4;
+        int byte_idx = i % 4;
+        out_data[word_idx] |= 49u << (byte_idx * 8u);  // '1'
+    }
+    for (int i = 0; i < b58_len; i++) {
+        int out_idx = zeros + i;
+        int word_idx = out_idx / 4;
+        int byte_idx = out_idx % 4;
+        out_data[word_idx] |= BASE58_ALPHABET[b58[b58_len - 1 - i]] << (byte_idx * 8u);
+    }
+
+    return out_len;
+}
+
+// ============================================================================
+// Pattern Matching
+// ============================================================================
+
+uint get_pattern_byte(int idx) {
+    int word_idx = idx / 4;
+    int byte_idx = idx % 4;
+    return (pattern[word_idx] >> (byte_idx * 8u)) & 0xFFu;
+}
+
+uint get_addr_byte(in uint addr[12], int idx) {
+    int word_idx = idx / 4;
+    int byte_idx = idx % 4;
+    return (addr[word_idx] >> (byte_idx * 8u)) & 0xFFu;
+}
+
+bool pattern_matches(in uint addr[12], int addr_len) {
+    uint plen = length;
+    if (plen == 0u || addr_len < int(plen)) return false;
+
+    int start_pos, end_pos;
+
+    if (match_mode == 0u) {  // prefix
+        start_pos = 0;
+        end_pos = 1;
+    } else if (match_mode == 1u) {  // suffix
+        start_pos = addr_len - int(plen);
+        end_pos = start_pos + 1;
+    } else {  // anywhere
+        start_pos = 0;
+        end_pos = addr_len - int(plen) + 1;
+    }
+
+    for (int pos = start_pos; pos < end_pos; pos++) {
+        bool match_found = true;
+        for (uint i = 0u; i < plen && match_found; i++) {
+            uint pc = get_pattern_byte(int(i));
+            uint ac = get_addr_byte(addr, pos + int(i));
+
+            if (pc == 63u) continue;  // '?' wildcard
+
+            if (ignore_case != 0u) {
+                if (pc >= 65u && pc <= 90u) pc += 32u;
+                if (ac >= 65u && ac <= 90u) ac += 32u;
+            }
+
+            if (pc != ac) match_found = false;
+        }
+        if (match_found) return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// xorshift128+ PRNG
+// ============================================================================
+
+struct Rng {
+    uint64_t s0;
+    uint64_t s1;
+};
+
+uint64_t rng_next(inout Rng rng) {
+    uint64_t x = rng.s0;
+    uint64_t y = rng.s1;
+    rng.s0 = y;
+    x ^= x << 23u;
+    rng.s1 = x ^ y ^ (x >> 17u) ^ (y >> 26u);
+    return rng.s1 + y;
+}
+
+// ============================================================================
+// Main Kernel
+// ============================================================================
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+
+    // Check if another thread already found a match
+    if (atomicOr(found_flag, 0u) != 0u) return;
+
+    // Initialize RNG with unique state per thread
+    Rng rng;
+    rng.s0 = base_state[0] ^ (uint64_t(tid) * 0x9E3779B97F4A7C15UL);
+    rng.s1 = base_state[1] ^ (uint64_t(tid) * 0x6A09E667BB67AE85UL);
+
+    // Generate random 32-byte seed as 8 x uint32
+    uint seed[8];
+    for (int i = 0; i < 4; i++) {
+        uint64_t r = rng_next(rng);
+        seed[i * 2] = uint(r);
+        seed[i * 2 + 1] = uint(r >> 32u);
+    }
+
+    // SHA-512 hash the seed (32 bytes -> 64 bytes)
+    uint hash[16];
+    sha512_32bytes(seed, hash);
+
+    // Clamp scalar for Ed25519
+    hash[0] = (hash[0] & 0xFFFFFFF8u);  // Clear low 3 bits of first byte
+    hash[7] = (hash[7] & 0x7FFFFFFFu) | 0x40000000u;  // Clear high bit, set bit 254
+
+    // Scalar multiplication to get public key (use first 32 bytes = 8 uints)
+    uint scalar[8];
+    for (int i = 0; i < 8; i++) scalar[i] = hash[i];
+
+    GeP3 A;
+    ge_scalarmult_base(A, scalar);
+
+    // Convert to compressed Edwards format
+    uint pub_key[8];
+    ge_p3_tobytes(pub_key, A);
+
+    // Base58 encode
+    uint addr[12];
+    int addr_len = base58_encode(pub_key, addr);
+
+    // Pattern match
+    if (pattern_matches(addr, addr_len)) {
+        // Try to claim the result
+        uint old_val = atomicCompSwap(found_flag, 0u, 1u);
+        if (old_val == 0u) {
+            // We won the race - store result
+            found = 1u;
+            thread_id = tid;
+            address_len = uint(addr_len);
+
+            // Store public key
+            for (int i = 0; i < 8; i++) {
+                public_key[i] = pub_key[i];
+            }
+
+            // Store private key (hash + pubkey)
+            for (int i = 0; i < 16; i++) {
+                private_key[i] = hash[i];
+            }
+            // Overwrite second half with pubkey
+            for (int i = 0; i < 8; i++) {
+                private_key[8 + i] = pub_key[i];
+            }
+
+            // Store address
+            for (int i = 0; i < 12; i++) {
+                address_data[i] = addr[i];
+            }
+        }
+    }
+}

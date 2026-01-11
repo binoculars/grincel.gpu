@@ -10,7 +10,7 @@ const EMBEDDED_SHADER = mod.EMBEDDED_SHADER;
 
 /// Full GPU vanity search - SHA512, Ed25519, Base58, pattern matching all on GPU
 /// This is the highest throughput mode, performing all operations on the GPU.
-pub const FullGpuGrinder = struct {
+pub const MetalGrinder = struct {
     device: mtl.MTLDevice,
     command_queue: mtl.MTLCommandQueue,
     compute_pso: mtl.MTLComputePipelineState,

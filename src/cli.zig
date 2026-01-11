@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const Base58 = @import("cpu/base58.zig").Base58;
 const pattern_mod = @import("pattern.zig");
 const Pattern = pattern_mod.Pattern;
@@ -7,9 +8,15 @@ const MatchMode = pattern_mod.MatchMode;
 const grinders = @import("grinders/mod.zig");
 const FoundKey = grinders.FoundKey;
 const CpuGrinder = grinders.CpuGrinder;
-const HybridGrinder = grinders.HybridGrinder;
-const FullGpuGrinder = grinders.FullGpuGrinder;
+const VulkanGrinder = grinders.VulkanGrinder;
 const BATCH_SIZE = grinders.BATCH_SIZE;
+
+// MetalGrinder only available on macOS
+const MetalGrinder = grinders.MetalGrinder;
+
+// Backend selection
+const GpuBackend = enum { metal, vulkan };
+const IS_MACOS = build_options.is_macos;
 
 // ============================================================================
 // CLI Entry Point
@@ -65,13 +72,16 @@ pub fn run() !void {
     // Default is case-insensitive (matches solana-keygen behavior)
     var ignore_case = !envIsTruthy(allocator, "CASE_SENSITIVE");
     var match_mode = getMatchMode(allocator);
-    var threads_per_group: ?usize = null; // null = use hardware max
+    var threads_per_group: ?usize = null; // null = use default (64)
+    var gpu_backend: ?GpuBackend = null; // null = auto-detect
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--cpu")) {
             use_gpu = false;
+        } else if (std.mem.eql(u8, arg, "--vulkan")) {
+            gpu_backend = .vulkan;
         } else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) {
             ignore_case = true;
         } else if (std.mem.eql(u8, arg, "--case-sensitive") or std.mem.eql(u8, arg, "-s")) {
@@ -96,19 +106,29 @@ pub fn run() !void {
         }
     }
 
+    // Auto-detect GPU backend if not specified
+    const selected_backend: ?GpuBackend = if (!use_gpu) null else if (gpu_backend) |b| b else blk: {
+        // Default: Metal on macOS, Vulkan elsewhere
+        if (IS_MACOS) {
+            break :blk .metal;
+        } else {
+            break :blk .vulkan;
+        }
+    };
+
     const options = PatternOptions{
         .ignore_case = ignore_case,
         .match_mode = match_mode,
     };
 
-    try searchVanity(allocator, pattern_str, options, use_gpu, match_count, threads_per_group);
+    try searchVanity(allocator, pattern_str, options, selected_backend, match_count, threads_per_group);
 }
 
 // ============================================================================
 // Search Functions
 // ============================================================================
 
-fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: PatternOptions, use_gpu: bool, match_count: u32, threads_per_group: ?usize) !void {
+fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: PatternOptions, backend: ?GpuBackend, match_count: u32, threads_per_group: ?usize) !void {
     std.debug.print("\n=== Solana Vanity Address Search ===\n", .{});
     std.debug.print("Pattern: {s}\n", .{pattern_str});
     std.debug.print("Match mode: {s}\n", .{@tagName(options.match_mode)});
@@ -116,7 +136,11 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
     if (match_count > 1) {
         std.debug.print("Finding: {d} matches\n", .{match_count});
     }
-    std.debug.print("Using: {s}\n", .{if (use_gpu) "Full GPU (Metal)" else "CPU"});
+    const backend_name = if (backend) |b| switch (b) {
+        .metal => "Metal GPU",
+        .vulkan => "Vulkan GPU",
+    } else "CPU";
+    std.debug.print("Using: {s}\n", .{backend_name});
 
     // Show difficulty estimate
     const stats = calculateDifficulty(pattern_str, options);
@@ -135,23 +159,50 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
 
     var found_count: u32 = 0;
 
-    if (use_gpu) {
-        var grinder = try FullGpuGrinder.init(allocator, pattern, threads_per_group);
-        defer grinder.deinit();
-        grinder.setP50(stats.p50_attempts);
+    if (backend) |b| {
+        switch (b) {
+            .metal => {
+                if (IS_MACOS) {
+                    var grinder = try MetalGrinder.init(allocator, pattern, threads_per_group);
+                    defer grinder.deinit();
+                    grinder.setP50(stats.p50_attempts);
 
-        std.debug.print("Searching...\n", .{});
-        while (found_count < match_count) {
-            if (try grinder.searchBatch(BATCH_SIZE * 100)) |found| {
-                found_count += 1;
-                std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count, match_count });
-                printFoundKey(found, pattern, allocator);
-                allocator.free(found.address);
+                    std.debug.print("Searching...\n", .{});
+                    while (found_count < match_count) {
+                        if (try grinder.searchBatch(BATCH_SIZE * 100)) |found| {
+                            found_count += 1;
+                            std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count, match_count });
+                            printFoundKey(found, pattern, allocator);
+                            allocator.free(found.address);
 
-                if (found_count < match_count) {
-                    std.debug.print("\nContinuing search...\n", .{});
+                            if (found_count < match_count) {
+                                std.debug.print("\nContinuing search...\n", .{});
+                            }
+                        }
+                    }
+                } else {
+                    unreachable; // Metal not available on this platform
                 }
-            }
+            },
+            .vulkan => {
+                var grinder = try VulkanGrinder.init(allocator, pattern, threads_per_group);
+                defer grinder.deinit();
+                grinder.setP50(stats.p50_attempts);
+
+                std.debug.print("Searching...\n", .{});
+                while (found_count < match_count) {
+                    if (try grinder.searchBatch(BATCH_SIZE * 100)) |found| {
+                        found_count += 1;
+                        std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count, match_count });
+                        printFoundKey(found, pattern, allocator);
+                        allocator.free(found.address);
+
+                        if (found_count < match_count) {
+                            std.debug.print("\nContinuing search...\n", .{});
+                        }
+                    }
+                }
+            },
         }
     } else {
         var grinder = CpuGrinder.init(allocator, pattern);
@@ -255,50 +306,60 @@ fn runBenchmark(allocator: std.mem.Allocator) !void {
     const cpu_rate = @as(f64, @floatFromInt(cpu_grinder.attempts)) / cpu_elapsed;
     std.debug.print("  CPU: {d:.2} k/s\n", .{cpu_rate / 1000.0});
 
-    // Hybrid GPU+CPU Benchmark
-    std.debug.print("Hybrid (GPU seeds + CPU derive) benchmark...\n", .{});
-    var hybrid_grinder = try HybridGrinder.init(allocator, pattern, null);
-    defer hybrid_grinder.deinit();
+    // Metal benchmark (macOS only)
+    var metal_rate: f64 = 0;
 
-    const hybrid_start = std.time.milliTimestamp();
-    while (std.time.milliTimestamp() - hybrid_start < BENCHMARK_DURATION_MS) {
-        if (try hybrid_grinder.searchBatch(BATCH_SIZE)) |found| {
+    if (IS_MACOS) {
+        std.debug.print("Metal GPU benchmark...\n", .{});
+        var metal_grinder = try MetalGrinder.init(allocator, pattern, null);
+        defer metal_grinder.deinit();
+
+        const metal_start = std.time.milliTimestamp();
+        while (std.time.milliTimestamp() - metal_start < BENCHMARK_DURATION_MS) {
+            if (try metal_grinder.searchBatch(BATCH_SIZE)) |found| {
+                allocator.free(found.address);
+            }
+        }
+        const metal_elapsed = @as(f64, @floatFromInt(std.time.milliTimestamp() - metal_start)) / 1000.0;
+        const metal_attempts = metal_grinder.attempts.load(.acquire);
+        metal_rate = @as(f64, @floatFromInt(metal_attempts)) / metal_elapsed;
+        std.debug.print("  Metal GPU: {d:.2} k/s\n", .{metal_rate / 1000.0});
+    }
+
+    // Vulkan GPU Benchmark
+    std.debug.print("Vulkan GPU benchmark...\n", .{});
+    var vulkan_grinder = try VulkanGrinder.init(allocator, pattern, null);
+    defer vulkan_grinder.deinit();
+
+    const vulkan_start = std.time.milliTimestamp();
+    while (std.time.milliTimestamp() - vulkan_start < BENCHMARK_DURATION_MS) {
+        if (try vulkan_grinder.searchBatch(BATCH_SIZE)) |found| {
             allocator.free(found.address);
         }
     }
-    const hybrid_elapsed = @as(f64, @floatFromInt(std.time.milliTimestamp() - hybrid_start)) / 1000.0;
-    const hybrid_attempts = hybrid_grinder.attempts.load(.acquire);
-    const hybrid_rate = @as(f64, @floatFromInt(hybrid_attempts)) / hybrid_elapsed;
-    std.debug.print("  Hybrid: {d:.2} k/s\n", .{hybrid_rate / 1000.0});
-
-    // Full GPU Benchmark
-    std.debug.print("Full GPU (all on GPU) benchmark...\n", .{});
-    var fullgpu_grinder = try FullGpuGrinder.init(allocator, pattern, null);
-    defer fullgpu_grinder.deinit();
-
-    const fullgpu_start = std.time.milliTimestamp();
-    while (std.time.milliTimestamp() - fullgpu_start < BENCHMARK_DURATION_MS) {
-        if (try fullgpu_grinder.searchBatch(BATCH_SIZE)) |found| {
-            allocator.free(found.address);
-        }
-    }
-    const fullgpu_elapsed = @as(f64, @floatFromInt(std.time.milliTimestamp() - fullgpu_start)) / 1000.0;
-    const fullgpu_attempts = fullgpu_grinder.attempts.load(.acquire);
-    const fullgpu_rate = @as(f64, @floatFromInt(fullgpu_attempts)) / fullgpu_elapsed;
-    std.debug.print("  Full GPU: {d:.2} k/s\n", .{fullgpu_rate / 1000.0});
+    const vulkan_elapsed = @as(f64, @floatFromInt(std.time.milliTimestamp() - vulkan_start)) / 1000.0;
+    const vulkan_attempts = vulkan_grinder.attempts.load(.acquire);
+    const vulkan_rate = @as(f64, @floatFromInt(vulkan_attempts)) / vulkan_elapsed;
+    std.debug.print("  Vulkan GPU: {d:.2} k/s\n", .{vulkan_rate / 1000.0});
 
     // Results
     std.debug.print("\n=== Results ===\n", .{});
-    std.debug.print("CPU:      {d:.2} k/s (baseline)\n", .{cpu_rate / 1000.0});
-    std.debug.print("Hybrid:   {d:.2} k/s ({d:.0}x faster)\n", .{ hybrid_rate / 1000.0, hybrid_rate / cpu_rate });
-    std.debug.print("Full GPU: {d:.2} k/s ({d:.0}x faster)\n", .{ fullgpu_rate / 1000.0, fullgpu_rate / cpu_rate });
+    std.debug.print("CPU:        {d:.2} k/s (baseline)\n", .{cpu_rate / 1000.0});
+    if (IS_MACOS) {
+        std.debug.print("Metal GPU:  {d:.2} k/s ({d:.0}x faster)\n", .{ metal_rate / 1000.0, metal_rate / cpu_rate });
+    }
+    std.debug.print("Vulkan GPU: {d:.2} k/s ({d:.0}x faster)\n", .{ vulkan_rate / 1000.0, vulkan_rate / cpu_rate });
 
     // Determine fastest
-    const best_rate = @max(cpu_rate, @max(hybrid_rate, fullgpu_rate));
-    if (best_rate == fullgpu_rate) {
-        std.debug.print("\nFull GPU mode is fastest!\n", .{});
-    } else if (best_rate == hybrid_rate) {
-        std.debug.print("\nHybrid mode is fastest!\n", .{});
+    const best_rate = if (IS_MACOS)
+        @max(cpu_rate, @max(metal_rate, vulkan_rate))
+    else
+        @max(cpu_rate, vulkan_rate);
+
+    if (IS_MACOS and best_rate == metal_rate) {
+        std.debug.print("\nMetal GPU mode is fastest!\n", .{});
+    } else if (best_rate == vulkan_rate) {
+        std.debug.print("\nVulkan GPU mode is fastest!\n", .{});
     } else {
         std.debug.print("\nCPU mode is fastest!\n", .{});
     }
@@ -374,14 +435,19 @@ fn printDuration(seconds: f64) void {
 // ============================================================================
 
 fn printUsage() void {
-    std.debug.print("grincel - Solana vanity address grinder with Metal GPU acceleration\n\n", .{});
+    const backend_desc = if (IS_MACOS) "Metal" else "Vulkan";
+    std.debug.print("grincel - Solana vanity address grinder with {s} GPU acceleration\n\n", .{backend_desc});
     std.debug.print("Usage: grincel <pattern>[:<count>] [options]\n", .{});
     std.debug.print("   or: VANITY_PATTERN=<pattern> grincel [options]\n", .{});
     std.debug.print("\nOptions:\n", .{});
     std.debug.print("  -h, --help            Show this help message\n", .{});
     std.debug.print("  -s, --case-sensitive  Case sensitive matching\n", .{});
-    std.debug.print("  -t, --threads N       Threads per threadgroup (default: 64)\n", .{});
+    std.debug.print("  -t, --threads N       Threads per workgroup (default: 64)\n", .{});
     std.debug.print("  --cpu                 Use CPU only (no GPU)\n", .{});
+    // Only show --vulkan flag on macOS where both backends are available
+    if (IS_MACOS) {
+        std.debug.print("  --vulkan              Use Vulkan GPU backend instead of Metal\n", .{});
+    }
     std.debug.print("  --prefix              Match at start of address (default)\n", .{});
     std.debug.print("  --suffix              Match at end of address\n", .{});
     std.debug.print("  --anywhere            Match anywhere in address\n", .{});

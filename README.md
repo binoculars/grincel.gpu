@@ -1,10 +1,11 @@
 # Grincel - GPU Vanity Address Generator
 
-A high-performance GPU-accelerated Solana vanity address generator written in Zig with Metal compute shaders.
+A high-performance GPU-accelerated Solana vanity address generator written in Zig with Metal and Vulkan compute shaders.
 
 ## Features
 
-- **Full GPU acceleration** - SHA-512, Ed25519, Base58, and pattern matching all run on Metal GPU
+- **Full GPU acceleration** - SHA-512, Ed25519, Base58, and pattern matching all run on GPU
+- **Cross-platform** - Metal on macOS, Vulkan on Linux/Windows
 - **~820k keys/sec** on Apple Silicon (vs ~2.3k/sec CPU-only, ~357x faster)
 - **Flexible pattern matching** - prefix, suffix, or anywhere in address
 - **Case-insensitive by default** (like solana-keygen)
@@ -13,12 +14,76 @@ A high-performance GPU-accelerated Solana vanity address generator written in Zi
 - **P50 time estimation** - shows estimated time to 50% probability
 - **Solana-compatible output** - saves keys as JSON in solana-keygen format
 
-## Building
+## Installation
 
-Requires Zig 0.14+ and macOS with Metal support.
+### macOS (Homebrew)
 
 ```bash
-zig build
+brew tap binoculars/grincel.gpu https://github.com/binoculars/grincel.gpu
+brew install grincel
+```
+
+### Linux (Homebrew)
+
+Requires [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux):
+
+```bash
+# Install Homebrew if not already installed
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Add to PATH (add to ~/.bashrc or ~/.zshrc for persistence)
+eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+
+# Install grincel
+brew tap binoculars/grincel.gpu https://github.com/binoculars/grincel.gpu
+brew install grincel
+```
+
+### Docker (GHCR)
+
+Pre-built images are available on GitHub Container Registry for `linux/amd64` and `linux/arm64`:
+
+```bash
+# Pull the latest image
+docker pull ghcr.io/binoculars/grincel.gpu:latest
+
+# Run with Vulkan GPU passthrough
+docker run --rm --device /dev/dri \
+  -v $(pwd):/output \
+  -w /output \
+  ghcr.io/binoculars/grincel.gpu Ace
+
+# Run in CPU-only mode (no GPU required)
+docker run --rm \
+  -v $(pwd):/output \
+  -w /output \
+  ghcr.io/binoculars/grincel.gpu Ace --cpu
+
+# Find 5 addresses ending with 'Sol'
+docker run --rm --device /dev/dri \
+  -v $(pwd):/output \
+  -w /output \
+  ghcr.io/binoculars/grincel.gpu Sol:5 --suffix
+
+# Use a specific version
+docker pull ghcr.io/binoculars/grincel.gpu:1.0.0
+```
+
+### Build from Source
+
+Requires Zig 0.15+ and platform-specific dependencies:
+
+**macOS:**
+```bash
+brew bundle
+zig build -Doptimize=ReleaseFast
+```
+
+**Linux:**
+```bash
+# Install Vulkan SDK and shaderc
+apt-get install libvulkan-dev shaderc
+zig build -Doptimize=ReleaseFast
 ```
 
 ## Usage
@@ -31,6 +96,7 @@ Options:
   -s, --case-sensitive  Case sensitive matching
   -t, --threads N       Threads per threadgroup (default: 64)
   --cpu                 Use CPU only (no GPU)
+  --vulkan              Use Vulkan backend (macOS only, Linux uses Vulkan by default)
   --prefix              Match at start of address (default)
   --suffix              Match at end of address
   --anywhere            Match anywhere in address
@@ -47,7 +113,7 @@ Valid characters: 1-9, A-H, J-N, P-Z, a-k, m-z (Base58, no 0/O/I/l)
 ## Example
 
 ```bash
-$ ./zig-out/bin/grincel Ace:2
+$ grincel Ace:2
 ```
 
 Output:
@@ -57,7 +123,7 @@ Pattern: Ace
 Match mode: prefix
 Case sensitive: false
 Finding: 2 matches
-Using: Full GPU (Metal)
+Using: Metal GPU
 
 Difficulty estimate:
   Effective pattern length: 3 chars
@@ -65,7 +131,6 @@ Difficulty estimate:
   Probability per attempt: 1 in 39304
   Expected attempts (mean): 39304
   P50 attempts (median): 27238
-  Estimated P50 time: <1 second (at ~800k keys/sec)
 
 Metal Device: Apple M1 Max
 Searching...
@@ -99,25 +164,28 @@ This format is compatible with `solana-keygen` and can be used directly with Sol
 
 ```bash
 # Find 5 addresses starting with 'Ace'
-./zig-out/bin/grincel Ace:5
+grincel Ace:5
 
 # Case-sensitive match
-./zig-out/bin/grincel ABC -s
+grincel ABC -s
 
 # Match at end of address
-./zig-out/bin/grincel XYZ --suffix
+grincel XYZ --suffix
 
 # Match anywhere in address
-./zig-out/bin/grincel Fun --anywhere
+grincel Fun --anywhere
 
 # Wildcard pattern (matches A?C where ? is any char)
-./zig-out/bin/grincel A?C
+grincel A?C
 
 # CPU-only mode
-./zig-out/bin/grincel TEST --cpu
+grincel TEST --cpu
+
+# Use Vulkan instead of Metal (macOS)
+grincel Ace --vulkan
 
 # Use 128 threads per threadgroup (experiment for best performance)
-./zig-out/bin/grincel Ace -t 128
+grincel Ace -t 128
 ```
 
 ## Input Validation
@@ -125,7 +193,7 @@ This format is compatible with `solana-keygen` and can be used directly with Sol
 Invalid Base58 characters are rejected with a clear error:
 
 ```bash
-$ ./zig-out/bin/grincel "0OIl"
+$ grincel "0OIl"
 Error: Invalid character '0' at position 0
 Base58 alphabet does not include: 0, O, I, l
 ```
@@ -133,23 +201,23 @@ Base58 alphabet does not include: 0, O, I, l
 ## Benchmark
 
 ```bash
-$ ./zig-out/bin/grincel --benchmark
+$ grincel --benchmark
 === Vanity Address Grinder Benchmark ===
 Running each mode for 10 seconds...
 
 CPU benchmark...
   CPU: 2.50 k/s
-Hybrid (GPU seeds + CPU derive) benchmark...
-  Hybrid: 16.62 k/s
-Full GPU (all on GPU) benchmark...
-  Full GPU: 823.28 k/s
+Metal GPU benchmark...
+  Metal GPU: 823.28 k/s
+Vulkan GPU benchmark...
+  Vulkan GPU: 780.15 k/s
 
 === Results ===
-CPU:      2.50 k/s (baseline)
-Hybrid:   16.62 k/s (7x faster)
-Full GPU: 823.28 k/s (329x faster)
+CPU:        2.50 k/s (baseline)
+Metal GPU:  823.28 k/s (329x faster)
+Vulkan GPU: 780.15 k/s (312x faster)
 
-Full GPU mode is fastest!
+Metal GPU mode is fastest!
 ```
 
 ## Difficulty Estimation
@@ -176,13 +244,14 @@ src/
   grinders/
     mod.zig         # Shared types and config
     cpu.zig         # CPU-only grinder
-    hybrid.zig      # GPU seeds + CPU derive
-    full_gpu.zig    # Full GPU implementation
+    metal.zig       # Metal GPU implementation (macOS)
+    vulkan.zig      # Vulkan GPU implementation (cross-platform)
   cpu/
     ed25519.zig     # Ed25519 implementation
     base58.zig      # Base58 encoding
   shaders/
     vanity.metal    # Metal compute shader
+    vanity.comp     # Vulkan/GLSL compute shader
 ```
 
 ## License

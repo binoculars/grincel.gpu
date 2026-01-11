@@ -1,0 +1,26 @@
+# Build artifacts
+zig-out/
+.zig-cache/
+
+# Output files
+*.json
+output/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+compose.yml
+.dockerignore
+
+# Documentation
+*.md
+LICENSE
+
+# macOS
+.DS_Store
