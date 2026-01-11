@@ -1,11 +1,14 @@
 # Grincel - GPU Vanity Address Generator
 
-A high-performance GPU-accelerated Solana vanity address generator written in Zig with Metal and Vulkan compute shaders.
+A high-performance GPU-accelerated Solana vanity address generator written in Zig.
+
+**Platforms:** macOS, Linux
+**GPU Backends:** Metal (macOS), Vulkan (Linux, macOS via MoltenVK)
 
 ## Features
 
 - **Full GPU acceleration** - SHA-512, Ed25519, Base58, and pattern matching all run on GPU
-- **Cross-platform** - Metal on macOS, Vulkan on Linux/Windows
+- **Cross-platform** - Metal on macOS (default), Vulkan on Linux (default) and macOS (via MoltenVK)
 - **~820k keys/sec** on Apple Silicon (vs ~2.3k/sec CPU-only, ~357x faster)
 - **Flexible pattern matching** - prefix, suffix, or anywhere in address
 - **Case-insensitive by default** (like solana-keygen)
@@ -237,22 +240,37 @@ The P50 (median) time is when you have a 50% chance of finding a match. Progress
 ## Architecture
 
 ```
-src/
-  main.zig          # Entry point
-  cli.zig           # CLI parsing, validation, search orchestration
-  pattern.zig       # Pattern matching logic
-  grinders/
-    mod.zig         # Shared types and config
-    cpu.zig         # CPU-only grinder
-    metal.zig       # Metal GPU implementation (macOS)
-    vulkan.zig      # Vulkan GPU implementation (cross-platform)
-  cpu/
-    ed25519.zig     # Ed25519 implementation
-    base58.zig      # Base58 encoding
-  shaders/
-    vanity.metal    # Metal compute shader
-    vanity.comp     # Vulkan/GLSL compute shader
+.
+├── build.zig           # Zig build configuration
+├── build.zig.zon       # Dependencies (vulkan-zig, zig-metal, etc.)
+├── libs/
+│   └── zigtrait/       # Vendored zigtrait library
+├── src/
+│   ├── main.zig        # Entry point
+│   ├── cli.zig         # CLI parsing, validation, search orchestration
+│   ├── pattern.zig     # Pattern matching logic
+│   ├── grinders/
+│   │   ├── mod.zig     # Shared types and conditional exports
+│   │   ├── cpu.zig     # CPU-only grinder
+│   │   ├── metal.zig   # Metal GPU implementation (macOS)
+│   │   └── vulkan.zig  # Vulkan GPU implementation (Linux, macOS)
+│   ├── cpu/
+│   │   ├── ed25519.zig # Ed25519 implementation
+│   │   └── base58.zig  # Base58 encoding
+│   └── shaders/
+│       ├── vanity.metal # Metal compute shader (embedded at compile time)
+│       └── vanity.comp  # Vulkan/GLSL compute shader (compiled to SPIR-V)
+├── Formula/
+│   └── grincel.rb      # Homebrew formula
+└── Dockerfile          # Multi-arch Linux container
 ```
+
+### Dependencies
+
+Managed via Zig's package manager (`build.zig.zon`):
+- **zig-metal** - Metal bindings for Zig (macOS GPU)
+- **vulkan-zig** - Vulkan bindings for Zig (cross-platform GPU)
+- **zigtrait** - Zig trait library (vendored)
 
 ## License
 
