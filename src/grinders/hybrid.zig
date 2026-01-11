@@ -8,7 +8,7 @@ const FoundKey = mod.FoundKey;
 const BATCH_SIZE = mod.BATCH_SIZE;
 const NUM_BUFFERS = mod.NUM_BUFFERS;
 const NUM_CPU_THREADS = mod.NUM_CPU_THREADS;
-const SHADER_PATH = mod.SHADER_PATH;
+const EMBEDDED_SHADER = mod.EMBEDDED_SHADER;
 
 /// GPU-accelerated seed generation with multi-threaded CPU processing
 /// Uses triple buffering + thread pool for maximum throughput:
@@ -44,25 +44,10 @@ pub const HybridGrinder = struct {
             return error.NoCommandQueue;
         };
 
-        // Load and compile shader from file
-        const shader_source = std.fs.cwd().readFileAlloc(allocator, SHADER_PATH, 1024 * 1024) catch |err| {
-            std.debug.print("Failed to load shader from {s}: {}\n", .{ SHADER_PATH, err });
-            command_queue.release();
-            device.release();
-            return error.ShaderLoadFailed;
-        };
-        defer allocator.free(shader_source);
+        // Use embedded shader (compiled into binary)
+        std.debug.print("Shader size: {d} bytes (embedded)\n", .{EMBEDDED_SHADER.len});
 
-        const shader_z = allocator.dupeZ(u8, shader_source) catch {
-            command_queue.release();
-            device.release();
-            return error.OutOfMemory;
-        };
-        defer allocator.free(shader_z);
-
-        std.debug.print("Loaded shader: {s} ({d} bytes)\n", .{ SHADER_PATH, shader_source.len });
-
-        const source_ns = mtl.NSString.stringWithUTF8String(shader_z.ptr);
+        const source_ns = mtl.NSString.stringWithUTF8String(EMBEDDED_SHADER.ptr);
         var library = device.newLibraryWithSourceOptionsError(source_ns, null, null) orelse {
             command_queue.release();
             device.release();

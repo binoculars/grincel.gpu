@@ -15,7 +15,9 @@ pub const BATCH_SIZE: usize = 65536; // Keys per batch - large batch for GPU eff
 pub const NUM_BUFFERS: usize = 3; // Triple buffering for continuous GPU utilization
 pub const PROGRESS_INTERVAL: u64 = 100000; // Report every N attempts
 pub const NUM_CPU_THREADS: usize = 8; // CPU threads for parallel key derivation
-pub const SHADER_PATH = "src/shaders/vanity.metal";
+
+// Shader is embedded at compile time - no external file needed at runtime
+pub const EMBEDDED_SHADER = @embedFile("../shaders/vanity.metal");
 
 // ============================================================================
 // Shared Types

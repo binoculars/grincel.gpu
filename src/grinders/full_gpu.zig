@@ -6,7 +6,7 @@ const FoundKey = mod.FoundKey;
 const GpuPatternConfig = mod.GpuPatternConfig;
 const GpuResultBuffer = mod.GpuResultBuffer;
 const BATCH_SIZE = mod.BATCH_SIZE;
-const SHADER_PATH = mod.SHADER_PATH;
+const EMBEDDED_SHADER = mod.EMBEDDED_SHADER;
 
 /// Full GPU vanity search - SHA512, Ed25519, Base58, pattern matching all on GPU
 /// This is the highest throughput mode, performing all operations on the GPU.
@@ -41,25 +41,10 @@ pub const FullGpuGrinder = struct {
             return error.NoCommandQueue;
         };
 
-        // Load and compile shader from file
-        const shader_source = std.fs.cwd().readFileAlloc(allocator, SHADER_PATH, 1024 * 1024) catch |err| {
-            std.debug.print("Failed to load shader from {s}: {}\n", .{ SHADER_PATH, err });
-            command_queue.release();
-            device.release();
-            return error.ShaderLoadFailed;
-        };
-        defer allocator.free(shader_source);
+        // Use embedded shader (compiled into binary)
+        std.debug.print("Shader size: {d} bytes (embedded)\n", .{EMBEDDED_SHADER.len});
 
-        const shader_z = allocator.dupeZ(u8, shader_source) catch {
-            command_queue.release();
-            device.release();
-            return error.OutOfMemory;
-        };
-        defer allocator.free(shader_z);
-
-        std.debug.print("Loaded shader: {s} ({d} bytes)\n", .{ SHADER_PATH, shader_source.len });
-
-        const source_ns = mtl.NSString.stringWithUTF8String(shader_z.ptr);
+        const source_ns = mtl.NSString.stringWithUTF8String(EMBEDDED_SHADER.ptr);
         var library = device.newLibraryWithSourceOptionsError(source_ns, null, null) orelse {
             std.debug.print("Shader compilation failed\n", .{});
             command_queue.release();
