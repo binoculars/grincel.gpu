@@ -113,11 +113,7 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
     std.debug.print("  Expected attempts (mean): {d:.0}\n", .{stats.expected_attempts});
     std.debug.print("  P50 attempts (median): {d:.0}\n", .{stats.p50_attempts});
 
-    // Estimate time based on expected key rate
-    const estimated_rate: f64 = if (use_gpu) 800_000 else 2_500; // keys/sec
-    const p50_seconds = stats.p50_attempts / estimated_rate;
-    printDuration(p50_seconds);
-    std.debug.print(" (at ~{d:.0}k keys/sec)\n", .{estimated_rate / 1000});
+    // P50 time shown during search based on actual measured rate
     std.debug.print("\n", .{});
 
     var pattern = try Pattern.init(allocator, pattern_str, options);
