@@ -475,7 +475,7 @@ fn saveKeyAsJson(allocator: std.mem.Allocator, found: FoundKey) !void {
     defer allocator.free(filename);
 
     // Build JSON content - Solana keypair format is a byte array of the 64-byte private key
-    var json_buf = std.ArrayList(u8).init(allocator);
+    var json_buf = std.array_list.Managed(u8).init(allocator);
     defer json_buf.deinit();
 
     try json_buf.appendSlice("[");

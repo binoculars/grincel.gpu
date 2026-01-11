@@ -20,13 +20,15 @@ pub fn build(b: *std.Build) void {
     // Main executable using zig-metal
     const exe = b.addExecutable(.{
         .name = "grincel",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig-metal", .module = zig_metal_module },
+            },
+        }),
     });
-
-    // Add zig-metal module
-    exe.root_module.addImport("zig-metal", zig_metal_module);
 
     // Link frameworks on macOS
     exe.linkFramework("Foundation");

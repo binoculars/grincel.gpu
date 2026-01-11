@@ -15,11 +15,11 @@ const SHADER_PATH = mod.SHADER_PATH;
 /// - GPU generates seeds in parallel across all cores
 /// - Multiple CPU threads process seeds simultaneously
 pub const HybridGrinder = struct {
-    device: *mtl.MTLDevice,
-    command_queue: *mtl.MTLCommandQueue,
-    compute_pso: *mtl.MTLComputePipelineState,
-    seed_buffers: [NUM_BUFFERS]*mtl.MTLBuffer,
-    state_buffers: [NUM_BUFFERS]*mtl.MTLBuffer,
+    device: mtl.MTLDevice,
+    command_queue: mtl.MTLCommandQueue,
+    compute_pso: mtl.MTLComputePipelineState,
+    seed_buffers: [NUM_BUFFERS]mtl.MTLBuffer,
+    state_buffers: [NUM_BUFFERS]mtl.MTLBuffer,
     pattern: Pattern,
     attempts: std.atomic.Value(u64),
     start_time: i64,
@@ -32,7 +32,7 @@ pub const HybridGrinder = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, pattern: Pattern) !Self {
-        const device = mtl.MTLCreateSystemDefaultDevice() orelse {
+        const device = mtl.createSystemDefaultDevice() orelse {
             return error.NoMetalDevice;
         };
 
@@ -63,7 +63,7 @@ pub const HybridGrinder = struct {
         std.debug.print("Loaded shader: {s} ({d} bytes)\n", .{ SHADER_PATH, shader_source.len });
 
         const source_ns = mtl.NSString.stringWithUTF8String(shader_z.ptr);
-        const library = device.newLibraryWithSourceOptionsError(source_ns, null, null) orelse {
+        var library = device.newLibraryWithSourceOptionsError(source_ns, null, null) orelse {
             command_queue.release();
             device.release();
             return error.ShaderCompileFailed;
@@ -71,14 +71,14 @@ pub const HybridGrinder = struct {
         defer library.release();
 
         const func_name = mtl.NSString.stringWithUTF8String("generate_seeds");
-        const func = library.newFunctionWithName(func_name) orelse {
+        var func = library.newFunctionWithName(func_name) orelse {
             command_queue.release();
             device.release();
             return error.FunctionNotFound;
         };
         defer func.release();
 
-        const compute_pso = device.newComputePipelineStateWithFunctionError(func, null) orelse {
+        var compute_pso = device.newComputePipelineStateWithFunctionError(func, null) orelse {
             command_queue.release();
             device.release();
             return error.PipelineCreationFailed;
@@ -89,8 +89,8 @@ pub const HybridGrinder = struct {
         std.debug.print("CPU threads for processing: {d}\n", .{NUM_CPU_THREADS});
 
         // Create triple-buffered resources
-        var seed_buffers: [NUM_BUFFERS]*mtl.MTLBuffer = undefined;
-        var state_buffers: [NUM_BUFFERS]*mtl.MTLBuffer = undefined;
+        var seed_buffers: [NUM_BUFFERS]mtl.MTLBuffer = undefined;
+        var state_buffers: [NUM_BUFFERS]mtl.MTLBuffer = undefined;
         const seed_buffer_size = BATCH_SIZE * 32;
 
         for (0..NUM_BUFFERS) |i| {
@@ -166,13 +166,13 @@ pub const HybridGrinder = struct {
         self.device.release();
     }
 
-    fn submitGpuWork(self: *Self, buffer_idx: usize) ?*mtl.MTLCommandBuffer {
+    fn submitGpuWork(self: *Self, buffer_idx: usize) ?mtl.MTLCommandBuffer {
         const state_ptr: *[2]u64 = @ptrCast(@alignCast(self.state_buffers[buffer_idx].contents()));
         state_ptr[0] = self.cpu_prng.next();
         state_ptr[1] = self.cpu_prng.next();
 
-        const cmd_buffer = self.command_queue.commandBuffer() orelse return null;
-        const encoder = cmd_buffer.computeCommandEncoder() orelse return null;
+        var cmd_buffer = self.command_queue.commandBuffer() orelse return null;
+        var encoder = cmd_buffer.computeCommandEncoder() orelse return null;
 
         encoder.setComputePipelineState(self.compute_pso);
         encoder.setBufferOffsetAtIndex(self.seed_buffers[buffer_idx], 0, 0);
@@ -268,7 +268,7 @@ pub const HybridGrinder = struct {
         const num_batches = max_attempts / BATCH_SIZE;
         if (num_batches == 0) return null;
 
-        var cmd_buffers: [NUM_BUFFERS]?*mtl.MTLCommandBuffer = .{ null, null, null };
+        var cmd_buffers: [NUM_BUFFERS]?mtl.MTLCommandBuffer = .{ null, null, null };
         var found = std.atomic.Value(bool).init(false);
         var result: ?FoundKey = null;
         var result_mutex = std.Thread.Mutex{};
@@ -281,7 +281,7 @@ pub const HybridGrinder = struct {
         var active_buffer: usize = 0;
 
         while (batch < num_batches and !found.load(.acquire)) {
-            if (cmd_buffers[active_buffer]) |cmd| {
+            if (cmd_buffers[active_buffer]) |*cmd| {
                 cmd.waitUntilCompleted();
             }
 

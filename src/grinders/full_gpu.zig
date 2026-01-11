@@ -11,13 +11,13 @@ const SHADER_PATH = mod.SHADER_PATH;
 /// Full GPU vanity search - SHA512, Ed25519, Base58, pattern matching all on GPU
 /// This is the highest throughput mode, performing all operations on the GPU.
 pub const FullGpuGrinder = struct {
-    device: *mtl.MTLDevice,
-    command_queue: *mtl.MTLCommandQueue,
-    compute_pso: *mtl.MTLComputePipelineState,
-    state_buffer: *mtl.MTLBuffer,
-    pattern_buffer: *mtl.MTLBuffer,
-    result_buffer: *mtl.MTLBuffer,
-    found_flag_buffer: *mtl.MTLBuffer,
+    device: mtl.MTLDevice,
+    command_queue: mtl.MTLCommandQueue,
+    compute_pso: mtl.MTLComputePipelineState,
+    state_buffer: mtl.MTLBuffer,
+    pattern_buffer: mtl.MTLBuffer,
+    result_buffer: mtl.MTLBuffer,
+    found_flag_buffer: mtl.MTLBuffer,
     pattern: Pattern,
     attempts: std.atomic.Value(u64),
     start_time: i64,
@@ -29,7 +29,7 @@ pub const FullGpuGrinder = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, pattern: Pattern) !Self {
-        const device = mtl.MTLCreateSystemDefaultDevice() orelse {
+        const device = mtl.createSystemDefaultDevice() orelse {
             return error.NoMetalDevice;
         };
 
@@ -60,7 +60,7 @@ pub const FullGpuGrinder = struct {
         std.debug.print("Loaded shader: {s} ({d} bytes)\n", .{ SHADER_PATH, shader_source.len });
 
         const source_ns = mtl.NSString.stringWithUTF8String(shader_z.ptr);
-        const library = device.newLibraryWithSourceOptionsError(source_ns, null, null) orelse {
+        var library = device.newLibraryWithSourceOptionsError(source_ns, null, null) orelse {
             std.debug.print("Shader compilation failed\n", .{});
             command_queue.release();
             device.release();
@@ -69,7 +69,7 @@ pub const FullGpuGrinder = struct {
         defer library.release();
 
         const func_name = mtl.NSString.stringWithUTF8String("vanity_search");
-        const func = library.newFunctionWithName(func_name) orelse {
+        var func = library.newFunctionWithName(func_name) orelse {
             std.debug.print("Function 'vanity_search' not found\n", .{});
             command_queue.release();
             device.release();
@@ -77,7 +77,7 @@ pub const FullGpuGrinder = struct {
         };
         defer func.release();
 
-        const compute_pso = device.newComputePipelineStateWithFunctionError(func, null) orelse {
+        var compute_pso = device.newComputePipelineStateWithFunctionError(func, null) orelse {
             command_queue.release();
             device.release();
             return error.PipelineCreationFailed;
@@ -88,14 +88,14 @@ pub const FullGpuGrinder = struct {
         std.debug.print("Full GPU mode: SHA512 + Ed25519 + Base58 + Pattern all on GPU\n", .{});
 
         // Create buffers
-        const state_buffer = device.newBufferWithLengthOptions(16, .MTLResourceCPUCacheModeDefaultCache) orelse {
+        var state_buffer = device.newBufferWithLengthOptions(16, .MTLResourceCPUCacheModeDefaultCache) orelse {
             compute_pso.release();
             command_queue.release();
             device.release();
             return error.BufferCreationFailed;
         };
 
-        const pattern_buffer = device.newBufferWithLengthOptions(@sizeOf(GpuPatternConfig), .MTLResourceCPUCacheModeDefaultCache) orelse {
+        var pattern_buffer = device.newBufferWithLengthOptions(@sizeOf(GpuPatternConfig), .MTLResourceCPUCacheModeDefaultCache) orelse {
             state_buffer.release();
             compute_pso.release();
             command_queue.release();
@@ -103,7 +103,7 @@ pub const FullGpuGrinder = struct {
             return error.BufferCreationFailed;
         };
 
-        const result_buffer = device.newBufferWithLengthOptions(@sizeOf(GpuResultBuffer), .MTLResourceCPUCacheModeDefaultCache) orelse {
+        var result_buffer = device.newBufferWithLengthOptions(@sizeOf(GpuResultBuffer), .MTLResourceCPUCacheModeDefaultCache) orelse {
             pattern_buffer.release();
             state_buffer.release();
             compute_pso.release();
@@ -172,8 +172,8 @@ pub const FullGpuGrinder = struct {
         state_ptr[0] = self.cpu_prng.next();
         state_ptr[1] = self.cpu_prng.next();
 
-        const cmd_buffer = self.command_queue.commandBuffer() orelse return null;
-        const encoder = cmd_buffer.computeCommandEncoder() orelse return null;
+        var cmd_buffer = self.command_queue.commandBuffer() orelse return null;
+        var encoder = cmd_buffer.computeCommandEncoder() orelse return null;
 
         encoder.setComputePipelineState(self.compute_pso);
         encoder.setBufferOffsetAtIndex(self.state_buffer, 0, 0);

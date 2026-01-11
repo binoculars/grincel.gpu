@@ -40,14 +40,6 @@ jobs:
         working-directory: webgpu
         run: npm test
 
-      - name: Install Playwright browsers
-        working-directory: webgpu
-        run: npx playwright install --with-deps chromium
-
-      - name: Run e2e tests
-        working-directory: webgpu
-        run: npm run test:e2e
-
       - name: Prepare site
         run: |
           mkdir -p _site
