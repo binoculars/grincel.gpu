@@ -1,24 +1,24 @@
 class Grincel < Formula
   desc "Solana vanity address grinder with Metal/Vulkan GPU acceleration"
   homepage "https://github.com/binoculars/grincel.gpu"
-  version "1.2.2"
+  version "1.3.1"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/binoculars/grincel.gpu/releases/download/v1.2.2/grincel-macos-arm64-v1.2.2.tar.gz"
-      sha256 "bcda37d24813d705b6b064206e3edb37410e53a5166c0ddd47fd97925d7ea6b6" # macos-arm64
+      url "https://github.com/binoculars/grincel.gpu/releases/download/v1.3.1/grincel-macos-arm64-v1.3.1.tar.gz"
+      sha256 "19ff34461ece190d3453a743fd817eca22d535ecffddce9df537d050affde64a" # macos-arm64
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/binoculars/grincel.gpu/releases/download/v1.2.2/grincel-linux-arm64-v1.2.2.tar.gz"
-      sha256 "6c4fa9c61eabb1c56256933a2e4e9f061f6eaf2df75110469e15608ef54d5e6d" # linux-arm64
+      url "https://github.com/binoculars/grincel.gpu/releases/download/v1.3.1/grincel-linux-arm64-v1.3.1.tar.gz"
+      sha256 "9793c261831c13334b053cd0f619e8057810a13ce33edae070f662fc0c3c4317" # linux-arm64
     end
     on_intel do
-      url "https://github.com/binoculars/grincel.gpu/releases/download/v1.2.2/grincel-linux-amd64-v1.2.2.tar.gz"
-      sha256 "d13784be9b136ba2e665dcbb978ff80a001600c4870ad50b0bab6eadf40cc720" # linux-amd64
+      url "https://github.com/binoculars/grincel.gpu/releases/download/v1.3.1/grincel-linux-amd64-v1.3.1.tar.gz"
+      sha256 "d79e278020d9c7fbefa736521cc459db117cfae1d419a8b74f9166d4619bb751" # linux-amd64
     end
   end
 
