@@ -14,6 +14,8 @@ pub const CpuGrinder = struct {
     start_time: i64,
     allocator: std.mem.Allocator,
     p50_attempts: f64,
+    /// When set, the search returns once this flag is true.
+    stop: ?*std.atomic.Value(bool) = null,
 
     const Self = @This();
 
@@ -39,6 +41,7 @@ pub const CpuGrinder = struct {
         var seed: [32]u8 = undefined;
 
         while (true) {
+            if (self.shouldStop()) return null;
             self.prng.fill(&seed);
             const keypair = Ed25519.generateKeypair(&seed);
 
@@ -69,6 +72,7 @@ pub const CpuGrinder = struct {
         const end_attempts = self.attempts + max_attempts;
 
         while (self.attempts < end_attempts) {
+            if (self.shouldStop()) return null;
             self.prng.fill(&seed);
             const keypair = Ed25519.generateKeypair(&seed);
 
@@ -88,6 +92,11 @@ pub const CpuGrinder = struct {
             }
         }
         return null;
+    }
+
+    fn shouldStop(self: *Self) bool {
+        if (self.stop) |flag| return flag.load(.monotonic);
+        return false;
     }
 
     fn reportProgress(self: *Self) void {

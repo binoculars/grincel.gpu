@@ -205,18 +205,106 @@ void fe_sub(thread Fe& r, thread const Fe& a, thread const Fe& b) {
     r.v[4] = a.v[4] - b.v[4] + 0xffffffffffffe;
 }
 
+// 51-bit limb products do not fit in int64. Accumulate them in 128 bits.
+struct U128 {
+    uint64_t lo;
+    uint64_t hi;
+};
+
+U128 u128_from_u64(uint64_t x) {
+    U128 r;
+    r.lo = x;
+    r.hi = 0;
+    return r;
+}
+
+U128 u128_mul_u64(uint64_t a, uint64_t b) {
+    uint64_t a0 = a & 0xffffffffULL;
+    uint64_t a1 = a >> 32;
+    uint64_t b0 = b & 0xffffffffULL;
+    uint64_t b1 = b >> 32;
+    uint64_t p0 = a0 * b0;
+    uint64_t p1 = a0 * b1;
+    uint64_t p2 = a1 * b0;
+    uint64_t p3 = a1 * b1;
+    uint64_t mid = (p0 >> 32) + (p1 & 0xffffffffULL) + (p2 & 0xffffffffULL);
+    U128 r;
+    r.lo = (p0 & 0xffffffffULL) | (mid << 32);
+    r.hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+    return r;
+}
+
+U128 u128_add(U128 a, U128 b) {
+    U128 r;
+    r.lo = a.lo + b.lo;
+    r.hi = a.hi + b.hi + ((r.lo < a.lo) ? 1ULL : 0ULL);
+    return r;
+}
+
+uint64_t u128_shr51(U128 a) {
+    return (a.lo >> 51) | (a.hi << 13);
+}
+
 void fe_mul(thread Fe& r, thread const Fe& a, thread const Fe& b) {
-    int64_t a0 = a.v[0], a1 = a.v[1], a2 = a.v[2], a3 = a.v[3], a4 = a.v[4];
-    int64_t b0 = b.v[0], b1 = b.v[1], b2 = b.v[2], b3 = b.v[3], b4 = b.v[4];
+    uint64_t ax[5];
+    uint64_t bx[5];
+    for (int i = 0; i < 5; i++) {
+        ax[i] = uint64_t(a.v[i]);
+        bx[i] = uint64_t(b.v[i]);
+    }
+    uint64_t a19_1 = 19ULL * ax[1];
+    uint64_t a19_2 = 19ULL * ax[2];
+    uint64_t a19_3 = 19ULL * ax[3];
+    uint64_t a19_4 = 19ULL * ax[4];
 
-    int64_t r0 = a0*b0 + 19*(a1*b4 + a2*b3 + a3*b2 + a4*b1);
-    int64_t r1 = a0*b1 + a1*b0 + 19*(a2*b4 + a3*b3 + a4*b2);
-    int64_t r2 = a0*b2 + a1*b1 + a2*b0 + 19*(a3*b4 + a4*b3);
-    int64_t r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 + 19*a4*b4;
-    int64_t r4 = a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0;
+    U128 rr[5];
+    rr[0] = u128_add(u128_add(u128_add(u128_add(
+        u128_mul_u64(ax[0], bx[0]), u128_mul_u64(a19_1, bx[4])),
+        u128_mul_u64(a19_2, bx[3])), u128_mul_u64(a19_3, bx[2])),
+        u128_mul_u64(a19_4, bx[1]));
+    rr[1] = u128_add(u128_add(u128_add(u128_add(
+        u128_mul_u64(ax[0], bx[1]), u128_mul_u64(ax[1], bx[0])),
+        u128_mul_u64(a19_2, bx[4])), u128_mul_u64(a19_3, bx[3])),
+        u128_mul_u64(a19_4, bx[2]));
+    rr[2] = u128_add(u128_add(u128_add(u128_add(
+        u128_mul_u64(ax[0], bx[2]), u128_mul_u64(ax[1], bx[1])),
+        u128_mul_u64(ax[2], bx[0])), u128_mul_u64(a19_3, bx[4])),
+        u128_mul_u64(a19_4, bx[3]));
+    rr[3] = u128_add(u128_add(u128_add(u128_add(
+        u128_mul_u64(ax[0], bx[3]), u128_mul_u64(ax[1], bx[2])),
+        u128_mul_u64(ax[2], bx[1])), u128_mul_u64(ax[3], bx[0])),
+        u128_mul_u64(a19_4, bx[4]));
+    rr[4] = u128_add(u128_add(u128_add(u128_add(
+        u128_mul_u64(ax[0], bx[4]), u128_mul_u64(ax[1], bx[3])),
+        u128_mul_u64(ax[2], bx[2])), u128_mul_u64(ax[3], bx[1])),
+        u128_mul_u64(ax[4], bx[0]));
 
-    r.v[0] = r0; r.v[1] = r1; r.v[2] = r2; r.v[3] = r3; r.v[4] = r4;
-    fe_reduce(r);
+    const uint64_t MASK = 0x7ffffffffffffULL;
+    uint64_t rs[5];
+    for (int i = 0; i < 4; i++) {
+        rs[i] = rr[i].lo & MASK;
+        rr[i + 1] = u128_add(rr[i + 1], u128_from_u64(u128_shr51(rr[i])));
+    }
+    rs[4] = rr[4].lo & MASK;
+    uint64_t carry = u128_shr51(rr[4]);
+    rs[0] += 19ULL * carry;
+
+    for (int i = 0; i < 4; i++) {
+        carry = rs[i] >> 51;
+        rs[i] &= MASK;
+        rs[i + 1] += carry;
+    }
+    carry = rs[4] >> 51;
+    rs[4] &= MASK;
+    rs[0] += 19ULL * carry;
+    for (int i = 0; i < 4; i++) {
+        carry = rs[i] >> 51;
+        rs[i] &= MASK;
+        rs[i + 1] += carry;
+    }
+    rs[4] &= MASK;
+
+    for (int i = 0; i < 5; i++) r.v[i] = int64_t(rs[i]);
 }
 
 void fe_sq(thread Fe& r, thread const Fe& a) {
@@ -427,7 +515,9 @@ void ge_p3_tobytes(thread uint8_t* out, thread const GeP3& p) {
     fe_mul(y, p.Y, recip);
 
     fe_to_bytes(out, y);
-    out[31] ^= (x.v[0] & 1) << 7;  // Encode sign of x in high bit
+    uint8_t xbytes[32];
+    fe_to_bytes(xbytes, x);
+    out[31] |= (xbytes[0] & 1) << 7;
 }
 
 // ============================================================================
@@ -545,7 +635,7 @@ struct ResultBuffer {
     uint32_t found;           // 1 if match found
     uint32_t thread_id;       // Thread that found match
     uint8_t public_key[32];   // Public key bytes
-    uint8_t private_key[64];  // Private key (hash + public)
+    uint8_t private_key[64];  // Solana keypair: raw seed || public key
     char address[48];         // Base58 address
     uint32_t address_len;     // Address length
 };
@@ -614,11 +704,9 @@ kernel void vanity_search(
 
             for (int i = 0; i < 32; i++) {
                 results->public_key[i] = public_key[i];
-                results->private_key[i] = hash[i];
+                // solana-keygen treats the first 32 bytes as the seed, not the clamped scalar.
+                results->private_key[i] = seed[i];
                 results->private_key[32 + i] = public_key[i];
-            }
-            for (int i = 32; i < 64; i++) {
-                results->private_key[i] = (i < 32 + addr_len) ? public_key[i - 32] : 0;
             }
             for (int i = 0; i < addr_len; i++) {
                 results->address[i] = address[i];

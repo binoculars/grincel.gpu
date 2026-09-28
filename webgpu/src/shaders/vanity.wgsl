@@ -285,7 +285,16 @@ fn fe_sub(a: Fe, b: Fe) -> Fe {
 fn fe_reduce(f: ptr<function, Fe>) {
     var c: i32;
     for (var i = 0u; i < 9u; i++) {
-        let shift = select(26u, 25u, (i & 1u) == 0u);
+        let shift = select(25u, 26u, (i & 1u) == 0u);
+        c = (*f).v[i] >> shift;
+        (*f).v[i] &= i32((1u << shift) - 1u);
+        (*f).v[i + 1u] += c;
+    }
+    c = (*f).v[9] >> 25;
+    (*f).v[9] &= 0x1ffffff;
+    (*f).v[0] += c * 19;
+    for (var i = 0u; i < 9u; i++) {
+        let shift = select(25u, 26u, (i & 1u) == 0u);
         c = (*f).v[i] >> shift;
         (*f).v[i] &= i32((1u << shift) - 1u);
         (*f).v[i + 1u] += c;
@@ -331,10 +340,10 @@ fn fe_mul(a: Fe, b: Fe) -> Fe {
             if (k < 10u) {
                 acc_add(&h, k, prod);
             } else {
-                // Reduce by 19: x * 2^255 = x * 19 (mod p)
-                let reduced = mul32(prod.x, 19u);
-                let reduced_hi = prod.y * 19u; // Approximate - high bits * 19
-                acc_add(&h, k - 10u, vec2<u32>(reduced.x, reduced.y + reduced_hi));
+                // Limb i+10 is 2^255 above limb i, and 2^255 ≡ 19 (mod p).
+                let low = mul32(prod.x, 19u);
+                let high = u64_mul(vec2<u32>(prod.y, 0u), vec2<u32>(19u, 0u));
+                acc_add(&h, k - 10u, u64_add(low, vec2<u32>(0u, high.x)));
             }
         }
     }
@@ -345,21 +354,16 @@ fn fe_mul(a: Fe, b: Fe) -> Fe {
 
     for (var i = 0u; i < 10u; i++) {
         let sum = u64_add(h[i], carry);
-        let bits = select(26u, 25u, (i & 1u) == 0u);
+        let bits = select(25u, 26u, (i & 1u) == 0u);
         let mask = (1u << bits) - 1u;
         r.v[i] = i32(sum.x & mask);
         carry = u64_shr(sum, bits);
     }
 
-    // Final reduction: carry * 19
-    let final_add = carry.x * 19u;
-    r.v[0] += i32(final_add);
-
-    // One more carry pass
-    var c: i32;
-    c = r.v[0] >> 26; r.v[1] += c; r.v[0] &= 0x3ffffff;
-    c = r.v[1] >> 25; r.v[2] += c; r.v[1] &= 0x1ffffff;
-
+    // carry is the coefficient of 2^255.
+    let scaled = u64_mul(carry, vec2<u32>(19u, 0u));
+    r.v[0] += i32(scaled.x);
+    fe_reduce(&r);
     return r;
 }
 
@@ -390,7 +394,7 @@ fn fe_to_bytes(f: Fe, b: ptr<function, array<u32, 8>>) {
     // Final reduction
     var c = (t.v[0] + 19) >> 26u;
     for (var i = 1u; i < 10u; i++) {
-        let shift = select(26u, 25u, (i & 1u) == 0u);
+        let shift = select(25u, 26u, (i & 1u) == 0u);
         c = (t.v[i] + c) >> shift;
     }
     t.v[0] += 19 * c;
@@ -562,7 +566,9 @@ fn ge_p3_tobytes(p: GeP3, out: ptr<function, array<u32, 8>>) {
     var x = fe_mul(p.X, recip);
     var y = fe_mul(p.Y, recip);
     fe_to_bytes(y, out);
-    (*out)[7] ^= (u32(x.v[0]) & 1u) << 31u;
+    var xbytes: array<u32, 8>;
+    fe_to_bytes(x, &xbytes);
+    (*out)[7] |= (xbytes[0] & 1u) << 31u;
 }
 
 // ============================================================================
@@ -742,7 +748,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             results.thread_id = tid;
             results.address_len = addr_len;
             for (var i = 0u; i < 8u; i++) { results.public_key[i] = pk[i]; }
-            for (var i = 0u; i < 8u; i++) { results.private_key[i] = hash[i]; }
+            // Solana keypair is the raw seed followed by the public key.
+            for (var i = 0u; i < 8u; i++) { results.private_key[i] = seed[i]; }
             for (var i = 0u; i < 8u; i++) { results.private_key[i+8u] = pk[i]; }
             for (var i = 0u; i < 12u; i++) { results.address[i] = address[i]; }
         }

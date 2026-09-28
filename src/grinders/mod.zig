@@ -109,7 +109,7 @@ pub const GpuResultBuffer = extern struct {
     found: u32, // 1 if match found
     thread_id: u32, // Thread that found match
     public_key: [32]u8, // Public key bytes
-    private_key: [64]u8, // Private key (hash + public)
+    private_key: [64]u8, // Solana keypair: raw seed || public key
     address: [48]u8, // Base58 address
     address_len: u32, // Address length
 };

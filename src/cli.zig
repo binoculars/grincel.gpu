@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const Base58 = @import("cpu/base58.zig").Base58;
+const Ed25519 = @import("cpu/ed25519.zig").Ed25519;
 const pattern_mod = @import("pattern.zig");
 const Pattern = pattern_mod.Pattern;
 const PatternOptions = pattern_mod.PatternOptions;
@@ -137,8 +138,8 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
         std.debug.print("Finding: {d} matches\n", .{match_count});
     }
     const backend_name = if (backend) |b| switch (b) {
-        .metal => "Metal GPU",
-        .vulkan => "Vulkan GPU",
+        .metal => "Metal GPU + CPU",
+        .vulkan => "Vulkan GPU + CPU",
     } else "CPU";
     std.debug.print("Using: {s}\n", .{backend_name});
 
@@ -163,45 +164,23 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
         switch (b) {
             .metal => {
                 if (IS_MACOS) {
-                    var grinder = try MetalGrinder.init(allocator, pattern, threads_per_group);
+                    var thread_safe = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
+                    const alloc = thread_safe.allocator();
+                    var grinder = try MetalGrinder.init(alloc, pattern, threads_per_group);
                     defer grinder.deinit();
                     grinder.setP50(stats.p50_attempts);
-
-                    std.debug.print("Searching...\n", .{});
-                    while (found_count < match_count) {
-                        if (try grinder.searchBatch(BATCH_SIZE * 100)) |found| {
-                            found_count += 1;
-                            std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count, match_count });
-                            printFoundKey(found, pattern, allocator);
-                            allocator.free(found.address);
-
-                            if (found_count < match_count) {
-                                std.debug.print("\nContinuing search...\n", .{});
-                            }
-                        }
-                    }
+                    found_count = try searchGpuAndCpu(MetalGrinder, &grinder, alloc, pattern, match_count, stats.p50_attempts, "Metal");
                 } else {
                     unreachable; // Metal not available on this platform
                 }
             },
             .vulkan => {
-                var grinder = try VulkanGrinder.init(allocator, pattern, threads_per_group);
+                var thread_safe = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
+                const alloc = thread_safe.allocator();
+                var grinder = try VulkanGrinder.init(alloc, pattern, threads_per_group);
                 defer grinder.deinit();
                 grinder.setP50(stats.p50_attempts);
-
-                std.debug.print("Searching...\n", .{});
-                while (found_count < match_count) {
-                    if (try grinder.searchBatch(BATCH_SIZE * 100)) |found| {
-                        found_count += 1;
-                        std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count, match_count });
-                        printFoundKey(found, pattern, allocator);
-                        allocator.free(found.address);
-
-                        if (found_count < match_count) {
-                            std.debug.print("\nContinuing search...\n", .{});
-                        }
-                    }
-                }
+                found_count = try searchGpuAndCpu(VulkanGrinder, &grinder, alloc, pattern, match_count, stats.p50_attempts, "Vulkan");
             },
         }
     } else {
@@ -224,6 +203,179 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
     }
 
     std.debug.print("\nDone! Found {d} matching address(es).\n", .{found_count});
+}
+
+const SharedHits = struct {
+    mutex: std.Thread.Mutex = .{},
+    keys: std.array_list.Managed(FoundKey),
+    cpu_attempts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn push(self: *SharedHits, key: FoundKey) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.keys.append(key) catch {
+            self.keys.allocator.free(key.address);
+        };
+    }
+
+    fn pop(self: *SharedHits) ?FoundKey {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.keys.pop();
+    }
+};
+
+const CpuWorker = struct {
+    grinder: CpuGrinder,
+    hits: *SharedHits,
+    stop: *std.atomic.Value(bool),
+};
+
+fn cpuWorkerMain(worker: *CpuWorker) void {
+    worker.grinder.stop = worker.stop;
+    var published: u64 = 0;
+    while (!worker.stop.load(.acquire)) {
+        const found = worker.grinder.searchBatch(4096) catch return;
+        const attempts = worker.grinder.attempts;
+        if (attempts > published) {
+            _ = worker.hits.cpu_attempts.fetchAdd(attempts - published, .monotonic);
+            published = attempts;
+        }
+        if (found) |key| worker.hits.push(key);
+    }
+}
+
+fn cpuWorkerCount() usize {
+    const n = std.Thread.getCpuCount() catch 2;
+    return if (n > 1) n - 1 else 1;
+}
+
+fn combinedAttempts(gpu_attempts: u64, hits: *SharedHits) u64 {
+    return gpu_attempts + hits.cpu_attempts.load(.monotonic);
+}
+
+fn takeCpuHits(
+    hits: *SharedHits,
+    gpu_attempts: u64,
+    found_count: *u32,
+    match_count: u32,
+    pattern: Pattern,
+    allocator: std.mem.Allocator,
+) void {
+    while (found_count.* < match_count) {
+        var found = hits.pop() orelse break;
+        found_count.* += 1;
+        found.attempts = combinedAttempts(gpu_attempts, hits);
+        std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count.*, match_count });
+        printFoundKey(found, pattern, allocator);
+        allocator.free(found.address);
+        if (found_count.* < match_count) {
+            std.debug.print("\nContinuing search...\n", .{});
+        }
+    }
+}
+
+fn reportHybrid(
+    gpu_label: []const u8,
+    gpu_attempts: u64,
+    cpu_attempts: u64,
+    start_ms: i64,
+    p50_attempts: f64,
+) void {
+    const total = gpu_attempts + cpu_attempts;
+    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+    const elapsed = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+    const rate = if (elapsed > 0) @as(f64, @floatFromInt(total)) / elapsed else 0;
+    const gpu_rate = if (elapsed > 0) @as(f64, @floatFromInt(gpu_attempts)) / elapsed else 0;
+    const cpu_rate = if (elapsed > 0) @as(f64, @floatFromInt(cpu_attempts)) / elapsed else 0;
+    std.debug.print("\r[{s}+CPU] {d} keys, {d:.0} k/s ({d:.0} GPU + {d:.0} CPU), ", .{
+        gpu_label,
+        total,
+        rate / 1000.0,
+        gpu_rate / 1000.0,
+        cpu_rate / 1000.0,
+    });
+    grinders.formatTimeToP50(total, p50_attempts, rate);
+    std.debug.print("        ", .{});
+}
+
+/// Run the GPU grinder on this thread and one CPU grinder on every other core.
+fn searchGpuAndCpu(
+    comptime Gpu: type,
+    gpu: *Gpu,
+    allocator: std.mem.Allocator,
+    pattern: Pattern,
+    match_count: u32,
+    p50_attempts: f64,
+    gpu_label: []const u8,
+) !u32 {
+    var stop = std.atomic.Value(bool).init(false);
+    var hits = SharedHits{
+        .keys = std.array_list.Managed(FoundKey).init(allocator),
+    };
+    defer {
+        while (hits.pop()) |key| allocator.free(key.address);
+        hits.keys.deinit();
+    }
+
+    const worker_count = cpuWorkerCount();
+    const workers = try allocator.alloc(CpuWorker, worker_count);
+    defer allocator.free(workers);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+
+    var started: usize = 0;
+    defer {
+        stop.store(true, .release);
+        for (threads[0..started]) |thread| thread.join();
+    }
+
+    const seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    const start_ms = std.time.milliTimestamp();
+    for (workers, threads, 0..) |*worker, *thread, i| {
+        worker.* = .{
+            .grinder = CpuGrinder.init(allocator, pattern),
+            .hits = &hits,
+            .stop = &stop,
+        };
+        worker.grinder.prng = std.Random.Xoshiro256.init(seed +% (@as(u64, i) +% 1) *% 0x9E3779B97F4A7C15);
+        worker.grinder.stop = &stop;
+        thread.* = try std.Thread.spawn(.{}, cpuWorkerMain, .{worker});
+        started += 1;
+    }
+
+    std.debug.print("CPU workers: {d}\n", .{worker_count});
+    std.debug.print("Searching...\n", .{});
+
+    var found_count: u32 = 0;
+    while (found_count < match_count) {
+        const gpu_attempts = gpu.attempts.load(.monotonic);
+        takeCpuHits(&hits, gpu_attempts, &found_count, match_count, pattern, allocator);
+        if (found_count >= match_count) break;
+
+        if (try gpu.searchBatch(BATCH_SIZE)) |found| {
+            if (found_count < match_count) {
+                var found_key = found;
+                found_count += 1;
+                found_key.attempts = combinedAttempts(gpu.attempts.load(.monotonic), &hits);
+                std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count, match_count });
+                printFoundKey(found_key, pattern, allocator);
+                allocator.free(found_key.address);
+                if (found_count < match_count) {
+                    std.debug.print("\nContinuing search...\n", .{});
+                }
+            } else {
+                allocator.free(found.address);
+            }
+        }
+
+        takeCpuHits(&hits, gpu.attempts.load(.monotonic), &found_count, match_count, pattern, allocator);
+        if (found_count < match_count) {
+            reportHybrid(gpu_label, gpu.attempts.load(.monotonic), hits.cpu_attempts.load(.monotonic), start_ms, p50_attempts);
+        }
+    }
+
+    return found_count;
 }
 
 // ============================================================================
@@ -257,6 +409,12 @@ fn printFoundKey(found: FoundKey, pattern: Pattern, allocator: std.mem.Allocator
         std.debug.print("  Got:      {s}\n", .{verified_address});
         return;
     }
+
+    if (!Ed25519.matchesSolanaKeypair(found.public_key, found.private_key)) {
+        std.debug.print("VERIFICATION FAILED: secret seed does not derive this public key\n", .{});
+        return;
+    }
+    std.debug.print("VERIFIED: Keypair matches solana-keygen format\n", .{});
 
     // Private key (64 bytes = 32 byte secret + 32 byte public for Solana)
     var privkey_b58_buf: [128]u8 = undefined;
@@ -443,7 +601,7 @@ fn printUsage() void {
     std.debug.print("  -h, --help            Show this help message\n", .{});
     std.debug.print("  -s, --case-sensitive  Case sensitive matching\n", .{});
     std.debug.print("  -t, --threads N       Threads per workgroup (default: 64)\n", .{});
-    std.debug.print("  --cpu                 Use CPU only (no GPU)\n", .{});
+    std.debug.print("  --cpu                 Use CPU only. The default uses the GPU and the other CPU cores\n", .{});
     // Only show --vulkan flag on macOS where both backends are available
     if (IS_MACOS) {
         std.debug.print("  --vulkan              Use Vulkan GPU backend instead of Metal\n", .{});
