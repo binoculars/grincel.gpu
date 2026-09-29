@@ -615,6 +615,10 @@ fn searchGpuAndCpu(
 
 fn printFoundKey(found: FoundKey, pattern: Pattern, allocator: std.mem.Allocator) void {
     std.debug.print("Address: {s}\n", .{found.address});
+    std.debug.print("Found by: {s}\n", .{switch (found.source) {
+        .cpu => "CPU",
+        .gpu => "GPU",
+    }});
     std.debug.print("Attempts: {d}\n", .{found.attempts});
 
     // Public key hex

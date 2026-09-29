@@ -26,11 +26,14 @@ pub const EMBEDDED_SHADER = if (build_options.is_macos) @embedFile("../shaders/v
 // Shared Types
 // ============================================================================
 
+pub const KeySource = enum { cpu, gpu };
+
 pub const FoundKey = struct {
     public_key: [32]u8,
     private_key: [64]u8,
     address: []const u8,
     attempts: u64,
+    source: KeySource,
 };
 
 pub const Sample = struct {
@@ -46,6 +49,7 @@ pub fn foundFromResult(allocator: std.mem.Allocator, result: GpuResultBuffer, at
         .private_key = result.private_key,
         .address = try allocator.dupe(u8, result.address[0..addr_len]),
         .attempts = attempts,
+        .source = .gpu,
     };
 }
 

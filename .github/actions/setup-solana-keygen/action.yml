@@ -1,0 +1,49 @@
+name: Set up solana-keygen
+description: Put solana-keygen from an Agave release on PATH.
+
+inputs:
+  version:
+    description: Agave release tag to download.
+    default: v3.0.14
+
+runs:
+  using: composite
+  steps:
+    - name: Pick Agave build
+      id: target
+      shell: bash
+      run: |
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          macOS-X64) target=x86_64-apple-darwin ;;
+          Linux-X64) target=x86_64-unknown-linux-gnu ;;
+          *)
+            echo "Agave does not publish solana-keygen for $RUNNER_OS-$RUNNER_ARCH" >&2
+            exit 1
+            ;;
+        esac
+        echo "target=$target" >> "$GITHUB_OUTPUT"
+
+    - name: Restore solana-keygen
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.solana-keygen
+        key: solana-keygen-${{ inputs.version }}-${{ steps.target.outputs.target }}
+
+    - name: Download solana-keygen
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        TARGET: ${{ steps.target.outputs.target }}
+      run: |
+        mkdir -p ~/.solana-keygen
+        curl -sSfL "https://github.com/anza-xyz/agave/releases/download/$VERSION/solana-release-$TARGET.tar.bz2" \
+          | tar -xjf - -C ~/.solana-keygen --strip-components=2 solana-release/bin/solana-keygen
+
+    - name: Add solana-keygen to PATH
+      shell: bash
+      run: |
+        echo "$HOME/.solana-keygen" >> "$GITHUB_PATH"
+        "$HOME/.solana-keygen/solana-keygen" --version

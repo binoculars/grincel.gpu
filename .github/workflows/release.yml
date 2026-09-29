@@ -19,13 +19,18 @@ jobs:
     with:
       optimize: ReleaseFast
 
-  release:
+  test:
     needs: build
+    uses: ./.github/workflows/test.yml
+
+  release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download binaries
         uses: actions/download-artifact@v4
         with:
+          pattern: grincel-*
           path: artifacts
 
       - name: Get version from tag
@@ -55,7 +60,7 @@ jobs:
           prerelease: ${{ contains(github.ref, '-') }}
 
   docker:
-    needs: build
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:

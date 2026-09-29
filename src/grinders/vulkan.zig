@@ -634,13 +634,7 @@ pub const VulkanGrinder = struct {
         var batch: u64 = 0;
         while (batch < num_batches) {
             if (self.runBatch()) |result| {
-                const addr_len = @min(result.address_len, 48);
-                return FoundKey{
-                    .public_key = result.public_key,
-                    .private_key = result.private_key,
-                    .address = try self.allocator.dupe(u8, result.address[0..addr_len]),
-                    .attempts = self.attempts.load(.acquire),
-                };
+                return try mod.foundFromResult(self.allocator, result, self.attempts.load(.acquire));
             }
 
             batch += 1;

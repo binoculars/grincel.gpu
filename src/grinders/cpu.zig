@@ -78,6 +78,7 @@ pub const CpuGrinder = struct {
                     .private_key = private,
                     .address = try self.allocator.dupe(u8, address),
                     .attempts = self.attempts,
+                    .source = .cpu,
                 };
             }
 
