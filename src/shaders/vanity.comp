@@ -31,6 +31,14 @@ layout(std430, binding = 3) buffer FoundFlag {
     uint found_flag;
 };
 
+layout(std430, binding = 4) readonly buffer BaseTable {
+    int64_t base_precomp[];
+};
+
+// One copy of the base table per workgroup. Gather from shared memory
+// instead of a storage buffer; the table is 30720 bytes.
+shared int64_t base_local[3840];
+
 // ============================================================================
 // SHA-512 Constants
 // ============================================================================
@@ -406,16 +414,6 @@ struct GeP3 {
     Fe X, Y, Z, T;
 };
 
-const int64_t GX[5] = int64_t[5](
-    0x62d608f25d51aL, 0x412a4b4f6592aL, 0x75b7171a4b31dL, 0x1ff60527118feL, 0x216936d3cd6e5L
-);
-const int64_t GY[5] = int64_t[5](
-    0x6666666666658L, 0x4ccccccccccccL, 0x1999999999999L, 0x3333333333333L, 0x6666666666666L
-);
-const int64_t D_CONST[5] = int64_t[5](
-    0x34dca135978a3L, 0x1a8283b156ebdL, 0x5e7a26001c029L, 0x739c663a03cbbL, 0x52036cee2b6ffL
-);
-
 void ge_p3_0(out GeP3 p) {
     for (int i = 0; i < 5; i++) {
         p.X.v[i] = 0L;
@@ -454,58 +452,99 @@ void ge_p3_dbl(out GeP3 r, in GeP3 p) {
     fe_mul(r.Z, F, G);
 }
 
-void ge_p3_add(out GeP3 r, in GeP3 p, in GeP3 q) {
-    Fe A, B, C, D, E, F, G, H;
-    Fe d2, qyminusx, qyplusx;
+struct GePrecomp {
+    Fe yplusx, yminusx, xy2d;
+};
 
-    for (int i = 0; i < 5; i++) d2.v[i] = D_CONST[i] * 2L;
-
-    fe_sub(A, p.Y, p.X);
-    fe_sub(qyminusx, q.Y, q.X);
-    fe_mul(A, A, qyminusx);
-
-    fe_add(B, p.Y, p.X);
-    fe_add(qyplusx, q.Y, q.X);
-    fe_mul(B, B, qyplusx);
-
-    fe_mul(C, p.T, q.T);
-    fe_mul(C, C, d2);
-
-    fe_mul(D, p.Z, q.Z);
-    fe_add(D, D, D);
-
-    fe_sub(E, B, A);
-    fe_sub(F, D, C);
-    fe_add(G, D, C);
-    fe_add(H, B, A);
-
-    fe_mul(r.X, E, F);
-    fe_mul(r.Y, G, H);
-    fe_mul(r.T, E, H);
-    fe_mul(r.Z, F, G);
+void fe_neg(out Fe r, in Fe a) {
+    r.v[0] = 0xfffffffffffdaL - a.v[0];
+    r.v[1] = 0xffffffffffffeL - a.v[1];
+    r.v[2] = 0xffffffffffffeL - a.v[2];
+    r.v[3] = 0xffffffffffffeL - a.v[3];
+    r.v[4] = 0xffffffffffffeL - a.v[4];
 }
 
-void ge_scalarmult_base(out GeP3 r, in uint s[8]) {
-    ge_p3_0(r);
+void ge_madd(out GeP3 r, in GeP3 p, in GePrecomp q) {
+    Fe ypx, ymx, xy2, z2, X, Y, Z, T;
+    fe_add(ypx, p.Y, p.X);
+    fe_sub(ymx, p.Y, p.X);
+    fe_mul(ypx, ypx, q.yplusx);
+    fe_mul(ymx, ymx, q.yminusx);
+    fe_mul(xy2, q.xy2d, p.T);
+    fe_add(z2, p.Z, p.Z);
+    fe_sub(X, ypx, ymx);
+    fe_add(Y, ypx, ymx);
+    fe_add(Z, z2, xy2);
+    fe_sub(T, z2, xy2);
+    fe_mul(r.X, X, T);
+    fe_mul(r.Y, Y, Z);
+    fe_mul(r.Z, Z, T);
+    fe_mul(r.T, X, Y);
+}
 
-    GeP3 G;
-    for (int i = 0; i < 5; i++) {
-        G.X.v[i] = GX[i];
-        G.Y.v[i] = GY[i];
-        G.Z.v[i] = (i == 0) ? 1L : 0L;
-    }
-    fe_mul(G.T, G.X, G.Y);
-
-    GeP3 Q = G;
-
-    for (int i = 0; i < 256; i++) {
-        int word_idx = i / 32;
-        int bit_idx = i % 32;
-
-        if (((s[word_idx] >> bit_idx) & 1u) != 0u) {
-            ge_p3_add(r, r, Q);
+void ge_select(out GePrecomp t, int pos, int b) {
+    if (b == 0) {
+        for (int i = 0; i < 5; i++) {
+            t.yplusx.v[i] = (i == 0) ? 1L : 0L;
+            t.yminusx.v[i] = (i == 0) ? 1L : 0L;
+            t.xy2d.v[i] = 0L;
         }
-        ge_p3_dbl(Q, Q);
+        return;
+    }
+    int absb = b;
+    int neg = 0;
+    if (b < 0) {
+        absb = -b;
+        neg = 1;
+    }
+    int base = (pos * 8 + (absb - 1)) * 15;
+    for (int i = 0; i < 5; i++) {
+        t.yplusx.v[i] = base_local[base + i];
+        t.yminusx.v[i] = base_local[base + 5 + i];
+        t.xy2d.v[i] = base_local[base + 10 + i];
+    }
+    if (neg != 0) {
+        Fe swap = t.yplusx;
+        t.yplusx = t.yminusx;
+        t.yminusx = swap;
+        Fe flipped;
+        fe_neg(flipped, t.xy2d);
+        t.xy2d = flipped;
+    }
+}
+
+// R = s * B. The high bit of s is clear. Signed radix-16, then the
+// ref10 chain: odd digits, four doublings, even digits.
+void ge_scalarmult_base(out GeP3 r, in uint s[8]) {
+    int e[64];
+    for (int i = 0; i < 32; i++) {
+        uint byte = (s[i >> 2] >> ((i & 3) * 8)) & 0xffu;
+        e[2 * i] = int(byte & 15u);
+        e[2 * i + 1] = int((byte >> 4u) & 15u);
+    }
+    int carry = 0;
+    for (int i = 0; i < 63; i++) {
+        e[i] += carry;
+        carry = (e[i] + 8) >> 4;
+        e[i] -= carry << 4;
+    }
+    e[63] += carry;
+
+    ge_p3_0(r);
+    GePrecomp t;
+    for (int i = 1; i < 64; i += 2) {
+        ge_select(t, i / 2, e[i]);
+        GeP3 acc = r;
+        ge_madd(r, acc, t);
+    }
+    for (int i = 0; i < 4; i++) {
+        GeP3 acc = r;
+        ge_p3_dbl(r, acc);
+    }
+    for (int i = 0; i < 64; i += 2) {
+        ge_select(t, i / 2, e[i]);
+        GeP3 acc = r;
+        ge_madd(r, acc, t);
     }
 }
 
@@ -656,6 +695,11 @@ uint64_t rng_next(inout Rng rng) {
 
 void main() {
     uint tid = gl_GlobalInvocationID.x;
+
+    for (uint i = gl_LocalInvocationID.x; i < 3840u; i += gl_WorkGroupSize.x) {
+        base_local[i] = base_precomp[i];
+    }
+    barrier();
 
     // Check if another thread already found a match
     if (atomicOr(found_flag, 0u) != 0u) return;

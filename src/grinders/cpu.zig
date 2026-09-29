@@ -36,59 +36,53 @@ pub const CpuGrinder = struct {
         self.p50_attempts = p50;
     }
 
+    const key_batch = 16;
+
     /// Search indefinitely for a matching vanity address
     pub fn search(self: *Self) !?FoundKey {
-        var seed: [32]u8 = undefined;
-
         while (true) {
             if (self.shouldStop()) return null;
-            self.prng.fill(&seed);
-            const keypair = Ed25519.generateKeypair(&seed);
-
-            var address_buf: [64]u8 = undefined;
-            const addr_len = try Base58.encode(&address_buf, &keypair.public);
-            const address = address_buf[0..addr_len];
-
-            self.attempts += 1;
-
-            if (self.pattern.matches(address)) {
-                return FoundKey{
-                    .public_key = keypair.public,
-                    .private_key = keypair.private,
-                    .address = try self.allocator.dupe(u8, address),
-                    .attempts = self.attempts,
-                };
-            }
-
-            if (self.attempts % PROGRESS_INTERVAL == 0) {
-                self.reportProgress();
-            }
+            if (try self.searchChunk(key_batch, true)) |found| return found;
         }
     }
 
     /// Search with a maximum number of attempts
     pub fn searchBatch(self: *Self, max_attempts: u64) !?FoundKey {
-        var seed: [32]u8 = undefined;
         const end_attempts = self.attempts + max_attempts;
-
         while (self.attempts < end_attempts) {
             if (self.shouldStop()) return null;
-            self.prng.fill(&seed);
-            const keypair = Ed25519.generateKeypair(&seed);
+            const room: usize = @intCast(@min(end_attempts - self.attempts, key_batch));
+            if (try self.searchChunk(room, false)) |found| return found;
+        }
+        return null;
+    }
 
+    fn searchChunk(self: *Self, n: usize, report: bool) !?FoundKey {
+        var seeds: [key_batch][32]u8 = undefined;
+        var pubs: [key_batch][32]u8 = undefined;
+        for (0..n) |i| self.prng.fill(&seeds[i]);
+        Ed25519.publicKeys(seeds[0..n], pubs[0..n]);
+
+        for (0..n) |i| {
             var address_buf: [64]u8 = undefined;
-            const addr_len = try Base58.encode(&address_buf, &keypair.public);
+            const addr_len = try Base58.encode(&address_buf, &pubs[i]);
             const address = address_buf[0..addr_len];
-
             self.attempts += 1;
 
             if (self.pattern.matches(address)) {
+                var private: [64]u8 = undefined;
+                private[0..32].* = seeds[i];
+                private[32..].* = pubs[i];
                 return FoundKey{
-                    .public_key = keypair.public,
-                    .private_key = keypair.private,
+                    .public_key = pubs[i],
+                    .private_key = private,
                     .address = try self.allocator.dupe(u8, address),
                     .attempts = self.attempts,
                 };
+            }
+
+            if (report and self.attempts % PROGRESS_INTERVAL == 0) {
+                self.reportProgress();
             }
         }
         return null;

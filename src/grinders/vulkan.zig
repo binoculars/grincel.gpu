@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vk = @import("vulkan");
 const spirv = @import("spirv");
+const base_precomp = @import("../base_precomp.zig");
 const mod = @import("mod.zig");
 const Pattern = mod.Pattern;
 const FoundKey = mod.FoundKey;
@@ -74,6 +75,7 @@ pub const VulkanGrinder = struct {
     pattern_buffer: BufferAllocation,
     result_buffer: BufferAllocation,
     found_flag_buffer: BufferAllocation,
+    base_table_buffer: BufferAllocation,
 
     // State
     pattern: Pattern,
@@ -211,12 +213,13 @@ pub const VulkanGrinder = struct {
 
         errdefer vkd.destroyShaderModule(device, shader_module, null);
 
-        // Create descriptor set layout (4 storage buffers)
+        // Create descriptor set layout (5 storage buffers)
         const bindings = [_]vk.DescriptorSetLayoutBinding{
             .{ .binding = 0, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = .{ .compute_bit = true }, .p_immutable_samplers = null },
             .{ .binding = 1, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = .{ .compute_bit = true }, .p_immutable_samplers = null },
             .{ .binding = 2, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = .{ .compute_bit = true }, .p_immutable_samplers = null },
             .{ .binding = 3, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = .{ .compute_bit = true }, .p_immutable_samplers = null },
+            .{ .binding = 4, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = .{ .compute_bit = true }, .p_immutable_samplers = null },
         };
 
         const descriptor_set_layout = vkd.createDescriptorSetLayout(device, &.{
@@ -279,13 +282,18 @@ pub const VulkanGrinder = struct {
         const found_flag_buffer = try createBuffer(vkd, device, &mem_props, 4);
         errdefer destroyBuffer(vkd, device, found_flag_buffer);
 
+        const base_table_buffer = try createBuffer(vkd, device, &mem_props, @sizeOf(@TypeOf(base_precomp.limbs)));
+        errdefer destroyBuffer(vkd, device, base_table_buffer);
+        const table_bytes = std.mem.asBytes(&base_precomp.limbs);
+        @memcpy(@as([*]u8, @ptrCast(base_table_buffer.mapped.?))[0..table_bytes.len], table_bytes);
+
         // Initialize pattern buffer
         const pattern_ptr: *GpuPatternConfig = @ptrCast(@alignCast(pattern_buffer.mapped));
         pattern_ptr.* = GpuPatternConfig.fromPattern(pattern);
 
         // Create descriptor pool
         const pool_sizes = [_]vk.DescriptorPoolSize{
-            .{ .type = .storage_buffer, .descriptor_count = 4 },
+            .{ .type = .storage_buffer, .descriptor_count = 5 },
         };
 
         const descriptor_pool = vkd.createDescriptorPool(device, &.{
@@ -316,6 +324,7 @@ pub const VulkanGrinder = struct {
             .{ .buffer = pattern_buffer.buffer, .offset = 0, .range = pattern_buffer.size },
             .{ .buffer = result_buffer.buffer, .offset = 0, .range = result_buffer.size },
             .{ .buffer = found_flag_buffer.buffer, .offset = 0, .range = found_flag_buffer.size },
+            .{ .buffer = base_table_buffer.buffer, .offset = 0, .range = base_table_buffer.size },
         };
 
         // For storage buffers, image_info and texel_buffer_view are unused but require valid pointers
@@ -327,6 +336,7 @@ pub const VulkanGrinder = struct {
             .{ .dst_set = descriptor_set, .dst_binding = 1, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = &dummy_image_info, .p_buffer_info = @ptrCast(&buffer_infos[1]), .p_texel_buffer_view = &dummy_buffer_view },
             .{ .dst_set = descriptor_set, .dst_binding = 2, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = &dummy_image_info, .p_buffer_info = @ptrCast(&buffer_infos[2]), .p_texel_buffer_view = &dummy_buffer_view },
             .{ .dst_set = descriptor_set, .dst_binding = 3, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = &dummy_image_info, .p_buffer_info = @ptrCast(&buffer_infos[3]), .p_texel_buffer_view = &dummy_buffer_view },
+            .{ .dst_set = descriptor_set, .dst_binding = 4, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = &dummy_image_info, .p_buffer_info = @ptrCast(&buffer_infos[4]), .p_texel_buffer_view = &dummy_buffer_view },
         };
 
         vkd.updateDescriptorSets(device, writes.len, &writes, 0, null);
@@ -389,6 +399,7 @@ pub const VulkanGrinder = struct {
             .pattern_buffer = pattern_buffer,
             .result_buffer = result_buffer,
             .found_flag_buffer = found_flag_buffer,
+            .base_table_buffer = base_table_buffer,
             .pattern = pattern,
             .attempts = std.atomic.Value(u64).init(0),
             .start_time = std.time.milliTimestamp(),
@@ -472,6 +483,7 @@ pub const VulkanGrinder = struct {
         self.vkd.destroyFence(self.device, self.fence, null);
         self.vkd.destroyCommandPool(self.device, self.command_pool, null);
         self.vkd.destroyDescriptorPool(self.device, self.descriptor_pool, null);
+        destroyBuffer(self.vkd, self.device, self.base_table_buffer);
         destroyBuffer(self.vkd, self.device, self.found_flag_buffer);
         destroyBuffer(self.vkd, self.device, self.result_buffer);
         destroyBuffer(self.vkd, self.device, self.pattern_buffer);
