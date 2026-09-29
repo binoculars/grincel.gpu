@@ -3,6 +3,7 @@ const mtl = @import("zig-metal");
 const mod = @import("mod.zig");
 const Pattern = mod.Pattern;
 const FoundKey = mod.FoundKey;
+const Sample = mod.Sample;
 const GpuPatternConfig = mod.GpuPatternConfig;
 const GpuResultBuffer = mod.GpuResultBuffer;
 const BATCH_SIZE = mod.BATCH_SIZE;
@@ -73,7 +74,6 @@ pub const MetalGrinder = struct {
         const default_threads: usize = 64;
         const threads_to_use = if (threads_per_group_override) |t| @min(t, max_threads) else @min(default_threads, max_threads);
         std.debug.print("Max threads per threadgroup: {d}\n", .{max_threads});
-        std.debug.print("Using threads per threadgroup: {d}\n", .{threads_to_use});
         std.debug.print("Full GPU mode: SHA512 + Ed25519 + Base58 + Pattern all on GPU\n", .{});
 
         // Create buffers
@@ -139,6 +139,43 @@ pub const MetalGrinder = struct {
     /// Set the P50 attempts for progress display
     pub fn setP50(self: *Self, p50: f64) void {
         self.p50_attempts = p50;
+    }
+
+    pub fn maxThreadgroupSize(self: *const Self) usize {
+        return self.max_threads_per_group;
+    }
+
+    pub fn threadgroupSize(self: *const Self) usize {
+        return self.threads_per_group;
+    }
+
+    pub fn setThreadgroupSize(self: *Self, n: usize) !void {
+        const size = @min(n, self.max_threads_per_group);
+        if (size == 0 or BATCH_SIZE % size != 0) return error.InvalidThreadgroup;
+        self.threads_per_group = size;
+    }
+
+    pub fn resetCounters(self: *Self) void {
+        self.attempts.store(0, .monotonic);
+        self.start_time = std.time.milliTimestamp();
+    }
+
+    /// Time `batches` dispatches. A match found along the way is returned once.
+    pub fn sample(self: *Self, batches: usize) !Sample {
+        const before = self.attempts.load(.monotonic);
+        const t0 = std.time.nanoTimestamp();
+        var found: ?FoundKey = null;
+        for (0..batches) |_| {
+            if (self.runBatch()) |result| {
+                if (found == null) found = try mod.foundFromResult(self.allocator, result, self.attempts.load(.acquire));
+            }
+        }
+        const nanos: u64 = @intCast(std.time.nanoTimestamp() - t0);
+        return .{
+            .keys = self.attempts.load(.monotonic) - before,
+            .nanos = nanos,
+            .found = found,
+        };
     }
 
     pub fn deinit(self: *Self) void {

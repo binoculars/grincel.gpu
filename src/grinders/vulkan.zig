@@ -6,6 +6,7 @@ const base_precomp = @import("../base_precomp.zig");
 const mod = @import("mod.zig");
 const Pattern = mod.Pattern;
 const FoundKey = mod.FoundKey;
+const Sample = mod.Sample;
 const GpuPatternConfig = mod.GpuPatternConfig;
 const GpuResultBuffer = mod.GpuResultBuffer;
 const BATCH_SIZE = mod.BATCH_SIZE;
@@ -48,6 +49,48 @@ fn getVkGetInstanceProcAddr() !vk.PfnGetInstanceProcAddr {
     return vulkan_loader.?.getProcAddr;
 }
 
+fn fitThreadgroup(requested: usize, max_threads: usize) usize {
+    var n = @min(if (requested == 0) 64 else requested, max_threads);
+    if (n == 0) return 1;
+    while (n > 1 and BATCH_SIZE % n != 0) n -= 1;
+    return n;
+}
+
+fn createComputePipeline(
+    vkd: vk.DeviceWrapper,
+    device: vk.Device,
+    shader_module: vk.ShaderModule,
+    pipeline_layout: vk.PipelineLayout,
+    local_size: usize,
+) !vk.Pipeline {
+    var spec_data: u32 = @intCast(local_size);
+    const map = vk.SpecializationMapEntry{
+        .constant_id = 0,
+        .offset = 0,
+        .size = @sizeOf(u32),
+    };
+    const spec = vk.SpecializationInfo{
+        .map_entry_count = 1,
+        .p_map_entries = @ptrCast(&map),
+        .data_size = @sizeOf(u32),
+        .p_data = &spec_data,
+    };
+    const pipeline_info = vk.ComputePipelineCreateInfo{
+        .stage = .{
+            .stage = .{ .compute_bit = true },
+            .module = shader_module,
+            .p_name = "main",
+            .p_specialization_info = &spec,
+        },
+        .layout = pipeline_layout,
+        .base_pipeline_handle = .null_handle,
+        .base_pipeline_index = -1,
+    };
+    var pipeline: vk.Pipeline = undefined;
+    _ = try vkd.createComputePipelines(device, .null_handle, 1, @ptrCast(&pipeline_info), null, @ptrCast(&pipeline));
+    return pipeline;
+}
+
 /// Vulkan compute grinder for cross-platform GPU vanity search
 pub const VulkanGrinder = struct {
     // Vulkan handles
@@ -84,6 +127,7 @@ pub const VulkanGrinder = struct {
     allocator: std.mem.Allocator,
     cpu_prng: std.Random.Xoshiro256,
     threads_per_group: usize,
+    max_threadgroup: usize,
     p50_attempts: f64,
 
     // Vulkan API wrappers
@@ -245,21 +289,14 @@ pub const VulkanGrinder = struct {
 
         errdefer vkd.destroyPipelineLayout(device, pipeline_layout, null);
 
-        // Create compute pipeline
-        var compute_pipeline: vk.Pipeline = undefined;
-        const pipeline_info = vk.ComputePipelineCreateInfo{
-            .stage = .{
-                .stage = .{ .compute_bit = true },
-                .module = shader_module,
-                .p_name = "main",
-                .p_specialization_info = null,
-            },
-            .layout = pipeline_layout,
-            .base_pipeline_handle = .null_handle,
-            .base_pipeline_index = -1,
-        };
+        const max_threadgroup: usize = @min(
+            device_props.limits.max_compute_work_group_size[0],
+            device_props.limits.max_compute_work_group_invocations,
+        );
+        const initial_threads = fitThreadgroup(threads_per_group_override orelse 64, max_threadgroup);
 
-        _ = vkd.createComputePipelines(device, .null_handle, 1, @ptrCast(&pipeline_info), null, @ptrCast(&compute_pipeline)) catch |err| {
+        // Create compute pipeline
+        const compute_pipeline = createComputePipeline(vkd, device, shader_module, pipeline_layout, initial_threads) catch |err| {
             std.debug.print("Failed to create compute pipeline: {any}\n", .{err});
             return error.ComputePipelineCreationFailed;
         };
@@ -373,9 +410,7 @@ pub const VulkanGrinder = struct {
 
         errdefer vkd.destroyFence(device, fence, null);
 
-        const default_threads: usize = 64;
-        const threads_to_use = threads_per_group_override orelse default_threads;
-        std.debug.print("Using workgroup size: {d}\n", .{threads_to_use});
+        std.debug.print("Max workgroup size: {d}\n", .{max_threadgroup});
         std.debug.print("Vulkan compute mode: SHA512 + Ed25519 + Base58 + Pattern all on GPU\n", .{});
 
         const cpu_seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
@@ -405,7 +440,8 @@ pub const VulkanGrinder = struct {
             .start_time = std.time.milliTimestamp(),
             .allocator = allocator,
             .cpu_prng = std.Random.Xoshiro256.init(cpu_seed),
-            .threads_per_group = threads_to_use,
+            .threads_per_group = initial_threads,
+            .max_threadgroup = max_threadgroup,
             .p50_attempts = 0,
             .vkb = vkb,
             .vki = vki,
@@ -479,6 +515,45 @@ pub const VulkanGrinder = struct {
         self.p50_attempts = p50;
     }
 
+    pub fn maxThreadgroupSize(self: *const Self) usize {
+        return self.max_threadgroup;
+    }
+
+    pub fn threadgroupSize(self: *const Self) usize {
+        return self.threads_per_group;
+    }
+
+    pub fn setThreadgroupSize(self: *Self, n: usize) !void {
+        const size = fitThreadgroup(n, self.max_threadgroup);
+        if (size == self.threads_per_group) return;
+        const pipeline = try createComputePipeline(self.vkd, self.device, self.shader_module, self.pipeline_layout, size);
+        self.vkd.destroyPipeline(self.device, self.compute_pipeline, null);
+        self.compute_pipeline = pipeline;
+        self.threads_per_group = size;
+    }
+
+    pub fn resetCounters(self: *Self) void {
+        self.attempts.store(0, .monotonic);
+        self.start_time = std.time.milliTimestamp();
+    }
+
+    pub fn sample(self: *Self, batches: usize) !Sample {
+        const before = self.attempts.load(.monotonic);
+        const t0 = std.time.nanoTimestamp();
+        var found: ?FoundKey = null;
+        for (0..batches) |_| {
+            if (self.runBatch()) |result| {
+                if (found == null) found = try mod.foundFromResult(self.allocator, result, self.attempts.load(.acquire));
+            }
+        }
+        const nanos: u64 = @intCast(std.time.nanoTimestamp() - t0);
+        return .{
+            .keys = self.attempts.load(.monotonic) - before,
+            .nanos = nanos,
+            .found = found,
+        };
+    }
+
     pub fn deinit(self: *Self) void {
         self.vkd.destroyFence(self.device, self.fence, null);
         self.vkd.destroyCommandPool(self.device, self.command_pool, null);
@@ -523,7 +598,7 @@ pub const VulkanGrinder = struct {
         self.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&self.descriptor_set), 0, null);
 
         // Dispatch compute work
-        const workgroups = @as(u32, @intCast(BATCH_SIZE / 64));
+        const workgroups = @as(u32, @intCast(BATCH_SIZE / self.threads_per_group));
         self.vkd.cmdDispatch(self.command_buffer, workgroups, 1, 1);
 
         self.vkd.endCommandBuffer(self.command_buffer) catch return null;

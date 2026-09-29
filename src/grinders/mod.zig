@@ -33,6 +33,22 @@ pub const FoundKey = struct {
     attempts: u64,
 };
 
+pub const Sample = struct {
+    keys: u64,
+    nanos: u64,
+    found: ?FoundKey,
+};
+
+pub fn foundFromResult(allocator: std.mem.Allocator, result: GpuResultBuffer, attempts: u64) !FoundKey {
+    const addr_len = @min(result.address_len, 48);
+    return .{
+        .public_key = result.public_key,
+        .private_key = result.private_key,
+        .address = try allocator.dupe(u8, result.address[0..addr_len]),
+        .attempts = attempts,
+    };
+}
+
 /// Statistics for difficulty estimation
 pub const DifficultyStats = struct {
     effective_length: usize,

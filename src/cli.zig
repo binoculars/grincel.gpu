@@ -169,7 +169,7 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
                     var grinder = try MetalGrinder.init(alloc, pattern, threads_per_group);
                     defer grinder.deinit();
                     grinder.setP50(stats.p50_attempts);
-                    found_count = try searchGpuAndCpu(MetalGrinder, &grinder, alloc, pattern, match_count, stats.p50_attempts, "Metal");
+                    found_count = try searchGpuAndCpu(MetalGrinder, &grinder, alloc, pattern, match_count, stats.p50_attempts, "Metal", threads_per_group == null);
                 } else {
                     unreachable; // Metal not available on this platform
                 }
@@ -180,26 +180,12 @@ fn searchVanity(allocator: std.mem.Allocator, pattern_str: []const u8, options: 
                 var grinder = try VulkanGrinder.init(alloc, pattern, threads_per_group);
                 defer grinder.deinit();
                 grinder.setP50(stats.p50_attempts);
-                found_count = try searchGpuAndCpu(VulkanGrinder, &grinder, alloc, pattern, match_count, stats.p50_attempts, "Vulkan");
+                found_count = try searchGpuAndCpu(VulkanGrinder, &grinder, alloc, pattern, match_count, stats.p50_attempts, "Vulkan", threads_per_group == null);
             },
         }
     } else {
-        var grinder = CpuGrinder.init(allocator, pattern);
-        grinder.setP50(stats.p50_attempts);
-
-        std.debug.print("Searching...\n", .{});
-        while (found_count < match_count) {
-            if (try grinder.searchBatch(BATCH_SIZE * 100)) |found| {
-                found_count += 1;
-                std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count, match_count });
-                printFoundKey(found, pattern, allocator);
-                allocator.free(found.address);
-
-                if (found_count < match_count) {
-                    std.debug.print("\nContinuing search...\n", .{});
-                }
-            }
-        }
+        var thread_safe = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
+        found_count = try searchCpu(thread_safe.allocator(), pattern, match_count, stats.p50_attempts);
     }
 
     std.debug.print("\nDone! Found {d} matching address(es).\n", .{found_count});
@@ -245,9 +231,222 @@ fn cpuWorkerMain(worker: *CpuWorker) void {
     }
 }
 
-fn cpuWorkerCount() usize {
-    const n = std.Thread.getCpuCount() catch 2;
-    return if (n > 1) n - 1 else 1;
+fn logicalCpus() usize {
+    const n = std.Thread.getCpuCount() catch 1;
+    return if (n == 0) 1 else n;
+}
+
+fn fillWorkerCandidates(n: usize, out: []usize) usize {
+    const raw = [_]usize{ n, if (n > 1) n - 1 else 1, @max(n / 2, 1) };
+    var count: usize = 0;
+    for (raw) |c| {
+        if (c == 0) continue;
+        var seen = false;
+        for (out[0..count]) |prev| {
+            if (prev == c) seen = true;
+        }
+        if (!seen) {
+            out[count] = c;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn keepFound(allocator: std.mem.Allocator, slot: *?FoundKey, key: ?FoundKey) void {
+    if (key) |found| {
+        if (slot.* == null) {
+            slot.* = found;
+        } else {
+            allocator.free(found.address);
+        }
+    }
+}
+
+fn rateOf(keys: u64, nanos: u64) f64 {
+    const secs = @as(f64, @floatFromInt(nanos)) / 1e9;
+    if (secs <= 0) return 0;
+    return @as(f64, @floatFromInt(keys)) / secs;
+}
+
+/// Time a few threadgroup widths and keep the fastest. `-t` skips this.
+fn tuneThreadgroup(gpu: anytype, allocator: std.mem.Allocator, found: *?FoundKey) !void {
+    const max_threads = gpu.maxThreadgroupSize();
+    const options = [_]usize{ 32, 64, 128, 256, 512 };
+    var list: [options.len]usize = undefined;
+    var n_opts: usize = 0;
+    for (options) |n| {
+        if (n <= max_threads and BATCH_SIZE % n == 0) {
+            list[n_opts] = n;
+            n_opts += 1;
+        }
+    }
+    if (n_opts == 0) return;
+
+    const warm = try gpu.sample(1);
+    keepFound(allocator, found, warm.found);
+    if (found.* != null) return;
+
+    var best = list[0];
+    var best_rate: f64 = -1;
+    for (list[0..n_opts]) |n| {
+        try gpu.setThreadgroupSize(n);
+        const s = try gpu.sample(2);
+        keepFound(allocator, found, s.found);
+        const rate = rateOf(s.keys, s.nanos);
+        if (rate > best_rate) {
+            best_rate = rate;
+            best = n;
+        }
+        if (found.* != null) break;
+    }
+    try gpu.setThreadgroupSize(best);
+}
+
+fn tuneHybridWorkers(gpu: anytype, allocator: std.mem.Allocator, pattern: Pattern, found: *?FoundKey) !usize {
+    var list: [3]usize = undefined;
+    const n_opts = fillWorkerCandidates(logicalCpus(), &list);
+    var best = list[0];
+    var best_rate: f64 = -1;
+    for (list[0..n_opts]) |workers| {
+        if (found.* != null) break;
+        const rate = try sampleWithWorkers(gpu, allocator, pattern, workers, 2, found);
+        if (rate > best_rate) {
+            best_rate = rate;
+            best = workers;
+        }
+    }
+    return best;
+}
+
+fn tuneCpuWorkers(allocator: std.mem.Allocator, pattern: Pattern, found: *?FoundKey) !usize {
+    var list: [3]usize = undefined;
+    const n_opts = fillWorkerCandidates(logicalCpus(), &list);
+    var best = list[0];
+    var best_rate: f64 = -1;
+    for (list[0..n_opts]) |workers| {
+        if (found.* != null) break;
+        const rate = try sampleCpuWorkers(allocator, pattern, workers, 250, found);
+        if (rate > best_rate) {
+            best_rate = rate;
+            best = workers;
+        }
+    }
+    return best;
+}
+
+fn startWorkers(allocator: std.mem.Allocator, pattern: Pattern, worker_count: usize, stop: *std.atomic.Value(bool), hits: *SharedHits, workers: []CpuWorker, threads: []std.Thread) !usize {
+    const seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var started: usize = 0;
+    errdefer {
+        stop.store(true, .release);
+        for (threads[0..started]) |thread| thread.join();
+    }
+    for (workers[0..worker_count], threads[0..worker_count], 0..) |*worker, *thread, i| {
+        worker.* = .{
+            .grinder = CpuGrinder.init(allocator, pattern),
+            .hits = hits,
+            .stop = stop,
+        };
+        worker.grinder.prng = std.Random.Xoshiro256.init(seed +% (@as(u64, i) +% 1) *% 0x9E3779B97F4A7C15);
+        worker.grinder.stop = stop;
+        thread.* = try std.Thread.spawn(.{}, cpuWorkerMain, .{worker});
+        started += 1;
+    }
+    return started;
+}
+
+fn stopWorkers(stop: *std.atomic.Value(bool), threads: []std.Thread, started: usize) void {
+    stop.store(true, .release);
+    for (threads[0..started]) |thread| thread.join();
+}
+
+fn sampleWithWorkers(gpu: anytype, allocator: std.mem.Allocator, pattern: Pattern, worker_count: usize, batches: usize, found: *?FoundKey) !f64 {
+    var stop = std.atomic.Value(bool).init(false);
+    var hits = SharedHits{ .keys = std.array_list.Managed(FoundKey).init(allocator) };
+    const workers = try allocator.alloc(CpuWorker, worker_count);
+    defer allocator.free(workers);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+
+    const started = try startWorkers(allocator, pattern, worker_count, &stop, &hits, workers, threads);
+    const s = gpu.sample(batches) catch |err| {
+        stopWorkers(&stop, threads, started);
+        while (hits.pop()) |key| allocator.free(key.address);
+        hits.keys.deinit();
+        return err;
+    };
+    stopWorkers(&stop, threads, started);
+    keepFound(allocator, found, s.found);
+    while (hits.pop()) |key| keepFound(allocator, found, key);
+    const cpu_keys = hits.cpu_attempts.load(.monotonic);
+    hits.keys.deinit();
+    return rateOf(s.keys + cpu_keys, s.nanos);
+}
+
+fn sampleCpuWorkers(allocator: std.mem.Allocator, pattern: Pattern, worker_count: usize, millis: u64, found: *?FoundKey) !f64 {
+    var stop = std.atomic.Value(bool).init(false);
+    var hits = SharedHits{ .keys = std.array_list.Managed(FoundKey).init(allocator) };
+    const workers = try allocator.alloc(CpuWorker, worker_count);
+    defer allocator.free(workers);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+
+    const started = try startWorkers(allocator, pattern, worker_count, &stop, &hits, workers, threads);
+    const t0 = std.time.nanoTimestamp();
+    std.Thread.sleep(millis * std.time.ns_per_ms);
+    stopWorkers(&stop, threads, started);
+    const nanos: u64 = @intCast(std.time.nanoTimestamp() - t0);
+    while (hits.pop()) |key| keepFound(allocator, found, key);
+    const cpu_keys = hits.cpu_attempts.load(.monotonic);
+    hits.keys.deinit();
+    return rateOf(cpu_keys, nanos);
+}
+
+fn searchCpu(allocator: std.mem.Allocator, pattern: Pattern, match_count: u32, p50_attempts: f64) !u32 {
+    var early: ?FoundKey = null;
+    std.debug.print("Tuning CPU workers...\n", .{});
+    const worker_count = try tuneCpuWorkers(allocator, pattern, &early);
+
+    var found_count: u32 = 0;
+    if (early) |key| {
+        found_count = 1;
+        std.debug.print("\n\n*** FOUND MATCH 1/{d}! ***\n", .{match_count});
+        printFoundKey(key, pattern, allocator);
+        allocator.free(key.address);
+        early = null;
+        if (found_count >= match_count) return found_count;
+    }
+
+    std.debug.print("Using {d} CPU workers\n", .{worker_count});
+    var stop = std.atomic.Value(bool).init(false);
+    var hits = SharedHits{ .keys = std.array_list.Managed(FoundKey).init(allocator) };
+    defer {
+        while (hits.pop()) |key| allocator.free(key.address);
+        hits.keys.deinit();
+    }
+    const workers = try allocator.alloc(CpuWorker, worker_count);
+    defer allocator.free(workers);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+    const started = try startWorkers(allocator, pattern, worker_count, &stop, &hits, workers, threads);
+    defer stopWorkers(&stop, threads, started);
+
+    std.debug.print("Searching...\n", .{});
+    const start_ms = std.time.milliTimestamp();
+    while (found_count < match_count) {
+        takeCpuHits(&hits, 0, &found_count, match_count, pattern, allocator);
+        if (found_count >= match_count) break;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        const cpu_attempts = hits.cpu_attempts.load(.monotonic);
+        const elapsed_ms = std.time.milliTimestamp() - start_ms;
+        const elapsed = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+        const rate = if (elapsed > 0) @as(f64, @floatFromInt(cpu_attempts)) / elapsed else 0;
+        std.debug.print("\r[CPU] {d} keys, {d:.0} k/s, ", .{ cpu_attempts, rate / 1000.0 });
+        grinders.formatTimeToP50(cpu_attempts, p50_attempts, rate);
+        std.debug.print("        ", .{});
+    }
+    return found_count;
 }
 
 fn combinedAttempts(gpu_attempts: u64, hits: *SharedHits) u64 {
@@ -299,7 +498,7 @@ fn reportHybrid(
     std.debug.print("        ", .{});
 }
 
-/// Run the GPU grinder on this thread and one CPU grinder on every other core.
+/// Run the GPU grinder on this thread and CPU grinders on the cores that measured fastest.
 fn searchGpuAndCpu(
     comptime Gpu: type,
     gpu: *Gpu,
@@ -308,7 +507,42 @@ fn searchGpuAndCpu(
     match_count: u32,
     p50_attempts: f64,
     gpu_label: []const u8,
+    tune_gpu: bool,
 ) !u32 {
+    var early: ?FoundKey = null;
+    if (tune_gpu) {
+        std.debug.print("Tuning GPU threads and CPU workers...\n", .{});
+        try tuneThreadgroup(gpu, allocator, &early);
+    } else {
+        std.debug.print("Tuning CPU workers...\n", .{});
+    }
+
+    var found_count: u32 = 0;
+    if (early) |key| {
+        found_count = 1;
+        std.debug.print("\n\n*** FOUND MATCH 1/{d}! ***\n", .{match_count});
+        printFoundKey(key, pattern, allocator);
+        allocator.free(key.address);
+        early = null;
+        if (found_count >= match_count) return found_count;
+    }
+
+    const worker_count = try tuneHybridWorkers(gpu, allocator, pattern, &early);
+    if (early) |key| {
+        if (found_count < match_count) {
+            found_count += 1;
+            std.debug.print("\n\n*** FOUND MATCH {d}/{d}! ***\n", .{ found_count, match_count });
+            printFoundKey(key, pattern, allocator);
+            allocator.free(key.address);
+            early = null;
+            if (found_count >= match_count) return found_count;
+        } else {
+            allocator.free(key.address);
+            early = null;
+        }
+    }
+    gpu.resetCounters();
+    std.debug.print("Using {d} GPU threads and {d} CPU workers\n", .{ gpu.threadgroupSize(), worker_count });
     var stop = std.atomic.Value(bool).init(false);
     var hits = SharedHits{
         .keys = std.array_list.Managed(FoundKey).init(allocator),
@@ -318,7 +552,6 @@ fn searchGpuAndCpu(
         hits.keys.deinit();
     }
 
-    const worker_count = cpuWorkerCount();
     const workers = try allocator.alloc(CpuWorker, worker_count);
     defer allocator.free(workers);
     const threads = try allocator.alloc(std.Thread, worker_count);
@@ -344,10 +577,8 @@ fn searchGpuAndCpu(
         started += 1;
     }
 
-    std.debug.print("CPU workers: {d}\n", .{worker_count});
     std.debug.print("Searching...\n", .{});
 
-    var found_count: u32 = 0;
     while (found_count < match_count) {
         const gpu_attempts = gpu.attempts.load(.monotonic);
         takeCpuHits(&hits, gpu_attempts, &found_count, match_count, pattern, allocator);
@@ -600,8 +831,8 @@ fn printUsage() void {
     std.debug.print("\nOptions:\n", .{});
     std.debug.print("  -h, --help            Show this help message\n", .{});
     std.debug.print("  -s, --case-sensitive  Case sensitive matching\n", .{});
-    std.debug.print("  -t, --threads N       Threads per workgroup (default: 64)\n", .{});
-    std.debug.print("  --cpu                 Use CPU only. The default uses the GPU and the other CPU cores\n", .{});
+    std.debug.print("  -t, --threads N       GPU threads per workgroup. Default: measured at startup\n", .{});
+    std.debug.print("  --cpu                 Use CPUs only. The default uses the GPU and CPUs together\n", .{});
     // Only show --vulkan flag on macOS where both backends are available
     if (IS_MACOS) {
         std.debug.print("  --vulkan              Use Vulkan GPU backend instead of Metal\n", .{});
